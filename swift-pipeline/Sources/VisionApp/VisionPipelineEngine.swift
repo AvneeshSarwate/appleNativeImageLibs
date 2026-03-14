@@ -12,19 +12,22 @@ final class PipelineConfig: @unchecked Sendable {
     private var _enableHands = true
     private var _enableFace = true
     private var _segQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced
+    private var _batchMode = false
 
     var enableSeg: Bool { lock.withLock { _enableSeg } }
     var enableBody: Bool { lock.withLock { _enableBody } }
     var enableHands: Bool { lock.withLock { _enableHands } }
     var enableFace: Bool { lock.withLock { _enableFace } }
     var segQuality: VNGeneratePersonSegmentationRequest.QualityLevel { lock.withLock { _segQuality } }
+    var batchMode: Bool { lock.withLock { _batchMode } }
 
     func update(seg: Bool, body: Bool, hands: Bool, face: Bool,
-                quality: VNGeneratePersonSegmentationRequest.QualityLevel) {
+                quality: VNGeneratePersonSegmentationRequest.QualityLevel,
+                batch: Bool) {
         lock.withLock {
             _enableSeg = seg; _enableBody = body
             _enableHands = hands; _enableFace = face
-            _segQuality = quality
+            _segQuality = quality; _batchMode = batch
         }
     }
 }
@@ -36,11 +39,16 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     @Published var isRunning = false
     @Published var imageSize: CGSize = CGSize(width: 1920, height: 1080)
 
-    // Per-request timing (ms)
+    // Per-request timing — rolling averages (ms)
     @Published var segMs: Double = 0
     @Published var bodyMs: Double = 0
     @Published var handMs: Double = 0
     @Published var faceMs: Double = 0
+    private var segHistory: [Double] = []
+    private var bodyHistory: [Double] = []
+    private var handHistory: [Double] = []
+    private var faceHistory: [Double] = []
+    private let avgWindow = 10
 
     // UI-bound toggles
     @Published var enableSeg = true
@@ -48,6 +56,7 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     @Published var enableHands = true
     @Published var enableFace = true
     @Published var segQualityIndex = 1  // 0=fast, 1=balanced, 2=accurate
+    @Published var batchMode = false    // true = single perform() call, no per-request timing
 
     // Thread-safe config for videoQueue
     let config = PipelineConfig()
@@ -61,17 +70,23 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         }
         config.update(seg: enableSeg, body: enableBody,
                       hands: enableHands, face: enableFace,
-                      quality: q)
+                      quality: q, batch: batchMode)
     }
 
     private var captureSession: AVCaptureSession?
-    private let videoQueue = DispatchQueue(label: "vision-video-capture")
+    private let videoQueue = DispatchQueue(label: "vision-video-capture", qos: .userInitiated)
 
     // Vision requests — created once, reused across frames (accessed from videoQueue)
     private let segRequest: VNGeneratePersonSegmentationRequest
     private let bodyPoseRequest: VNDetectHumanBodyPoseRequest
     private let handPoseRequest: VNDetectHumanHandPoseRequest
     private let faceLandmarksRequest: VNDetectFaceLandmarksRequest
+
+    // Sequence handlers — one per request, reuse across frames for temporal optimization
+    private let segSeqHandler = VNSequenceRequestHandler()
+    private let bodySeqHandler = VNSequenceRequestHandler()
+    private let handSeqHandler = VNSequenceRequestHandler()
+    private let faceSeqHandler = VNSequenceRequestHandler()
 
     // Timing
     private var frameTimes: [Double] = []
@@ -132,47 +147,66 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         let doHands = config.enableHands
         let doFace = config.enableFace
         let quality = config.segQuality
+        let batch = config.batchMode
 
         if segRequest.qualityLevel != quality {
             segRequest.qualityLevel = quality
         }
 
         var tSeg: Double = 0, tBody: Double = 0, tHand: Double = 0, tFace: Double = 0
-
         var maskPB: CVPixelBuffer? = nil
-        if doSeg {
-            let h = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-            let s = CFAbsoluteTimeGetCurrent()
-            try? h.perform([segRequest])
-            tSeg = (CFAbsoluteTimeGetCurrent() - s) * 1000
-            maskPB = (segRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
-        }
-
         var bodies: [BodyPoseData] = []
-        if doBody {
-            let h = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-            let s = CFAbsoluteTimeGetCurrent()
-            try? h.perform([bodyPoseRequest])
-            tBody = (CFAbsoluteTimeGetCurrent() - s) * 1000
-            bodies = extractBodyPoses(imgW: imgW, imgH: imgH)
-        }
-
         var hands: [HandPoseData] = []
-        if doHands {
-            let h = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-            let s = CFAbsoluteTimeGetCurrent()
-            try? h.perform([handPoseRequest])
-            tHand = (CFAbsoluteTimeGetCurrent() - s) * 1000
-            hands = extractHandPoses(imgW: imgW, imgH: imgH)
-        }
-
         var faces: [FaceLandmarkData] = []
-        if doFace {
-            let h = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-            let s = CFAbsoluteTimeGetCurrent()
-            try? h.perform([faceLandmarksRequest])
-            tFace = (CFAbsoluteTimeGetCurrent() - s) * 1000
-            faces = extractFaceLandmarks(imgW: imgW, imgH: imgH)
+
+        if batch {
+            // Batched: single perform() call, Vision can share image preprocessing
+            var requests: [VNRequest] = []
+            if doSeg { requests.append(segRequest) }
+            if doBody { requests.append(bodyPoseRequest) }
+            if doHands { requests.append(handPoseRequest) }
+            if doFace { requests.append(faceLandmarksRequest) }
+
+            if !requests.isEmpty {
+                let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+                try? handler.perform(requests)
+            }
+
+            if doSeg {
+                maskPB = (segRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
+            }
+            if doBody { bodies = extractBodyPoses(imgW: imgW, imgH: imgH) }
+            if doHands { hands = extractHandPoses(imgW: imgW, imgH: imgH) }
+            if doFace { faces = extractFaceLandmarks(imgW: imgW, imgH: imgH) }
+        } else {
+            // Individual: separate perform() calls with per-request timing
+            if doSeg {
+                let s = CFAbsoluteTimeGetCurrent()
+                try? segSeqHandler.perform([segRequest], on: pixelBuffer)
+                tSeg = (CFAbsoluteTimeGetCurrent() - s) * 1000
+                maskPB = (segRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
+            }
+
+            if doBody {
+                let s = CFAbsoluteTimeGetCurrent()
+                try? bodySeqHandler.perform([bodyPoseRequest], on: pixelBuffer)
+                tBody = (CFAbsoluteTimeGetCurrent() - s) * 1000
+                bodies = extractBodyPoses(imgW: imgW, imgH: imgH)
+            }
+
+            if doHands {
+                let s = CFAbsoluteTimeGetCurrent()
+                try? handSeqHandler.perform([handPoseRequest], on: pixelBuffer)
+                tHand = (CFAbsoluteTimeGetCurrent() - s) * 1000
+                hands = extractHandPoses(imgW: imgW, imgH: imgH)
+            }
+
+            if doFace {
+                let s = CFAbsoluteTimeGetCurrent()
+                try? faceSeqHandler.perform([faceLandmarksRequest], on: pixelBuffer)
+                tFace = (CFAbsoluteTimeGetCurrent() - s) * 1000
+                faces = extractFaceLandmarks(imgW: imgW, imgH: imgH)
+            }
         }
 
         let tEnd = CFAbsoluteTimeGetCurrent()
@@ -189,12 +223,22 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         Task { @MainActor in
             self.imageSize = CGSize(width: imgW, height: imgH)
             self.latestResult = result
-            self.segMs = tSeg
-            self.bodyMs = tBody
-            self.handMs = tHand
-            self.faceMs = tFace
+
+            self.segHistory.append(tSeg)
+            self.bodyHistory.append(tBody)
+            self.handHistory.append(tHand)
+            self.faceHistory.append(tFace)
+            if self.segHistory.count > self.avgWindow { self.segHistory.removeFirst() }
+            if self.bodyHistory.count > self.avgWindow { self.bodyHistory.removeFirst() }
+            if self.handHistory.count > self.avgWindow { self.handHistory.removeFirst() }
+            if self.faceHistory.count > self.avgWindow { self.faceHistory.removeFirst() }
+            self.segMs = self.segHistory.reduce(0, +) / Double(self.segHistory.count)
+            self.bodyMs = self.bodyHistory.reduce(0, +) / Double(self.bodyHistory.count)
+            self.handMs = self.handHistory.reduce(0, +) / Double(self.handHistory.count)
+            self.faceMs = self.faceHistory.reduce(0, +) / Double(self.faceHistory.count)
+
             self.frameTimes.append(frameMs)
-            if self.frameTimes.count > self.maxFrameTimes { self.frameTimes.removeFirst() }
+            if self.frameTimes.count > self.avgWindow { self.frameTimes.removeFirst() }
             self.fps = 1000.0 / (self.frameTimes.reduce(0, +) / Double(self.frameTimes.count))
         }
     }

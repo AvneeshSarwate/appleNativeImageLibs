@@ -40,6 +40,8 @@ struct VisionCameraView: View {
                         Toggle("Body", isOn: $engine.enableBody)
                         Toggle("Hands", isOn: $engine.enableHands)
                         Toggle("Face", isOn: $engine.enableFace)
+                        Divider().background(Color.gray)
+                        Toggle("Batch mode", isOn: $engine.batchMode)
                     }
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.white)
@@ -51,26 +53,31 @@ struct VisionCameraView: View {
 
                     // Right: timing
                     VStack(alignment: .trailing, spacing: 3) {
-                        Text(String(format: "%.1f FPS", engine.fps))
+                        Text(String(format: "%5.1f FPS", engine.fps))
                             .font(.system(.title2, design: .monospaced))
                             .foregroundColor(.white)
                         if let r = engine.latestResult {
-                            Text(String(format: "total: %.1f ms", r.frameTimeMs))
+                            Text(String(format: "total: %6.1f ms", r.frameTimeMs))
                                 .foregroundColor(.white)
                         }
-                        HStack(spacing: 12) {
-                            timingLabel("seg", engine.segMs, engine.enableSeg)
-                            timingLabel("body", engine.bodyMs, engine.enableBody)
-                        }
-                        HStack(spacing: 12) {
-                            timingLabel("hand", engine.handMs, engine.enableHands)
-                            timingLabel("face", engine.faceMs, engine.enableFace)
+                        if engine.batchMode {
+                            Text("  (batched)")
+                                .foregroundColor(.orange)
+                        } else {
+                            HStack(spacing: 12) {
+                                timingLabel("seg ", engine.segMs, engine.enableSeg)
+                                timingLabel("body", engine.bodyMs, engine.enableBody)
+                            }
+                            HStack(spacing: 12) {
+                                timingLabel("hand", engine.handMs, engine.enableHands)
+                                timingLabel("face", engine.faceMs, engine.enableFace)
+                            }
                         }
                         if let r = engine.latestResult {
                             let bodyCount = r.bodyPoses.first?.joints.count ?? 0
                             let handCount = r.handPoses.reduce(0) { $0 + $1.joints.count }
                             let faceCount = r.faceLandmarks.reduce(0) { $0 + $1.allPoints.count }
-                            Text("\(bodyCount)b \(handCount)h \(faceCount)f pts")
+                            Text(String(format: "%2db %2dh %2df pts", bodyCount, handCount, faceCount))
                                 .foregroundColor(.gray)
                         }
                     }
@@ -87,6 +94,7 @@ struct VisionCameraView: View {
         .onChange(of: engine.enableBody) { _ in engine.syncConfig() }
         .onChange(of: engine.enableHands) { _ in engine.syncConfig() }
         .onChange(of: engine.enableFace) { _ in engine.syncConfig() }
+        .onChange(of: engine.batchMode) { _ in engine.syncConfig() }
         .task {
             do {
                 try engine.start()
@@ -97,7 +105,7 @@ struct VisionCameraView: View {
     }
 
     func timingLabel(_ name: String, _ ms: Double, _ enabled: Bool) -> some View {
-        Text(enabled ? String(format: "%@: %.1f ms", name, ms) : "\(name): off")
+        Text(enabled ? String(format: "%@:%6.1f ms", name, ms) : "\(name):   off")
             .foregroundColor(enabled ? .green : .gray)
     }
 }

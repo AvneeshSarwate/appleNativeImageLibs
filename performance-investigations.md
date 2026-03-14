@@ -413,3 +413,27 @@ Ranked by estimated impact-to-effort ratio:
 - Accuracy: **100% exact** keypoint match vs ONNX reference
 - GPU usage: ~7ms per frame (DWPose-m only)
 - **33x speedup** vs original Python CPU baseline (503.6ms → 15.2ms)
+
+---
+
+## Apple Vision Framework Comparison
+
+Tested an alternative pipeline using Apple's native Vision framework (`VNGeneratePersonSegmentationRequest`, `VNDetectHumanBodyPoseRequest`, `VNDetectHumanHandPoseRequest`, `VNDetectFaceLandmarksRequest`) instead of custom CoreML models. See `swift-pipeline/Sources/VisionApp/`.
+
+### Performance
+- Roughly **half the framerate** of the CoreML pipeline (~30 FPS vs ~60 FPS)
+- No control over compute units — Vision decides ANE/GPU/CPU internally, no equivalent of `MLComputeUnits`
+- Batching all 4 requests in a single `perform()` call helps (Vision shares image preprocessing)
+- `VNSequenceRequestHandler` provides temporal optimization across frames
+
+### Keypoint Coverage
+- **Body**: 19 joints (comparable to DWPose's 17 body joints, adds neck + root)
+- **Hands**: 21 joints per hand (matches DWPose)
+- **Face**: 76 landmarks (comparable to DWPose's 68)
+- **Feet: NONE** — ankles are the lowest joints. No foot keypoints at all (DWPose provides 6: big toe, small toe, heel on each foot)
+
+### Verdict
+- Vision is simpler code (~500 lines, no model files, no preprocessing) but a black box for hardware scheduling
+- **Not suitable if foot keypoints are needed** — must use RTMPose/DWPose for that
+- **Not suitable if GPU headroom matters** — cannot pin to ANE-only like the CoreML pipeline
+- Useful as a quick baseline or if only body/hand/face tracking is needed without feet
