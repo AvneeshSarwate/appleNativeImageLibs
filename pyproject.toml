@@ -1,0 +1,17 @@
+[project]
+name = "applenativeimagelibs"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "coremltools>=9.0",
+    "numpy<2.4",
+    "onnx>=1.20.1",
+    "onnx2torch>=1.5.15",
+    "onnxruntime<1.24",
+    "onnxsim>=0.6.2",
+    "opencv-python>=4.13.0.92",
+    "rtmlib>=0.0.15",
+    "ultralytics>=8.4.21",
+]
