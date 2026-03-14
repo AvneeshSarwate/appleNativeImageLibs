@@ -43,19 +43,25 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     @Published var faceMs: Double = 0
 
     // UI-bound toggles
-    @Published var enableSeg = true { didSet { syncConfig() } }
-    @Published var enableBody = true { didSet { syncConfig() } }
-    @Published var enableHands = true { didSet { syncConfig() } }
-    @Published var enableFace = true { didSet { syncConfig() } }
-    @Published var segQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced { didSet { syncConfig() } }
+    @Published var enableSeg = true
+    @Published var enableBody = true
+    @Published var enableHands = true
+    @Published var enableFace = true
+    @Published var segQualityIndex = 1  // 0=fast, 1=balanced, 2=accurate
 
     // Thread-safe config for videoQueue
     let config = PipelineConfig()
 
-    private func syncConfig() {
+    func syncConfig() {
+        let q: VNGeneratePersonSegmentationRequest.QualityLevel
+        switch segQualityIndex {
+        case 0: q = .fast
+        case 2: q = .accurate
+        default: q = .balanced
+        }
         config.update(seg: enableSeg, body: enableBody,
                       hands: enableHands, face: enableFace,
-                      quality: segQuality)
+                      quality: q)
     }
 
     private var captureSession: AVCaptureSession?
@@ -131,38 +137,40 @@ class VisionPipelineEngine: NSObject, ObservableObject {
             segRequest.qualityLevel = quality
         }
 
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-
         var tSeg: Double = 0, tBody: Double = 0, tHand: Double = 0, tFace: Double = 0
 
         var maskPB: CVPixelBuffer? = nil
         if doSeg {
+            let h = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
             let s = CFAbsoluteTimeGetCurrent()
-            try? handler.perform([segRequest])
+            try? h.perform([segRequest])
             tSeg = (CFAbsoluteTimeGetCurrent() - s) * 1000
             maskPB = (segRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
         }
 
         var bodies: [BodyPoseData] = []
         if doBody {
+            let h = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
             let s = CFAbsoluteTimeGetCurrent()
-            try? handler.perform([bodyPoseRequest])
+            try? h.perform([bodyPoseRequest])
             tBody = (CFAbsoluteTimeGetCurrent() - s) * 1000
             bodies = extractBodyPoses(imgW: imgW, imgH: imgH)
         }
 
         var hands: [HandPoseData] = []
         if doHands {
+            let h = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
             let s = CFAbsoluteTimeGetCurrent()
-            try? handler.perform([handPoseRequest])
+            try? h.perform([handPoseRequest])
             tHand = (CFAbsoluteTimeGetCurrent() - s) * 1000
             hands = extractHandPoses(imgW: imgW, imgH: imgH)
         }
 
         var faces: [FaceLandmarkData] = []
         if doFace {
+            let h = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
             let s = CFAbsoluteTimeGetCurrent()
-            try? handler.perform([faceLandmarksRequest])
+            try? h.perform([faceLandmarksRequest])
             tFace = (CFAbsoluteTimeGetCurrent() - s) * 1000
             faces = extractFaceLandmarks(imgW: imgW, imgH: imgH)
         }

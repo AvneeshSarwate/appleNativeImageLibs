@@ -4,6 +4,8 @@ import Vision
 struct VisionCameraView: View {
     @StateObject private var engine = VisionPipelineEngine()
 
+    let qualityLabels = ["Fast", "Balanced", "Accurate"]
+
     var body: some View {
         ZStack {
             Color.black.edgesIgnoringSafeArea(.all)
@@ -15,6 +17,7 @@ struct VisionCameraView: View {
                 mirrored: true
             )
             .frame(width: 960, height: 540)
+            .allowsHitTesting(false)
 
             // Info + controls overlay
             VStack {
@@ -23,13 +26,16 @@ struct VisionCameraView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Toggle("Mask", isOn: $engine.enableSeg)
                         if engine.enableSeg {
-                            Picker("Quality", selection: $engine.segQuality) {
-                                Text("Fast").tag(VNGeneratePersonSegmentationRequest.QualityLevel.fast)
-                                Text("Balanced").tag(VNGeneratePersonSegmentationRequest.QualityLevel.balanced)
-                                Text("Accurate").tag(VNGeneratePersonSegmentationRequest.QualityLevel.accurate)
+                            HStack(spacing: 4) {
+                                ForEach(0..<3) { i in
+                                    Button(qualityLabels[i]) {
+                                        engine.segQualityIndex = i
+                                        engine.syncConfig()
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(engine.segQualityIndex == i ? .green : .gray)
+                                }
                             }
-                            .pickerStyle(.segmented)
-                            .frame(width: 200)
                         }
                         Toggle("Body", isOn: $engine.enableBody)
                         Toggle("Hands", isOn: $engine.enableHands)
@@ -77,6 +83,10 @@ struct VisionCameraView: View {
             }
             .padding()
         }
+        .onChange(of: engine.enableSeg) { _ in engine.syncConfig() }
+        .onChange(of: engine.enableBody) { _ in engine.syncConfig() }
+        .onChange(of: engine.enableHands) { _ in engine.syncConfig() }
+        .onChange(of: engine.enableFace) { _ in engine.syncConfig() }
         .task {
             do {
                 try engine.start()
