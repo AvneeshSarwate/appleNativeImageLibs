@@ -38,9 +38,37 @@ func runStandaloneBench() async throws {
               "median \(String(format: "%6.2f", m))ms")
     }
 
-    // Load models
-    let yoloALL = try await loadModel("yolo11s-seg.mlpackage", .all)
-    let poseALL = try await loadModel("rtmpose.mlpackage", .all)
+    func alternatingBench(_ yolo: MLModel, _ yoloIn: MLFeatureProvider,
+                          _ pose: MLModel, _ poseIn: MLFeatureProvider,
+                          label: String) async throws -> (Double, Double) {
+        for _ in 0..<10 {
+            let _ = try await yolo.prediction(from: yoloIn)
+            let _ = try await pose.prediction(from: poseIn)
+        }
+        var yT = [Double](), pT = [Double]()
+        for _ in 0..<200 {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let _ = try await yolo.prediction(from: yoloIn)
+            let t1 = CFAbsoluteTimeGetCurrent()
+            let _ = try await pose.prediction(from: poseIn)
+            let t2 = CFAbsoluteTimeGetCurrent()
+            yT.append(t1 - t0); pT.append(t2 - t1)
+        }
+        let ym = median(yT) * 1000, pm = median(pT) * 1000
+        print("\n--- \(label) ---")
+        print("  YOLO:    \(String(format: "%6.2f", ym))ms")
+        print("  RTMPose: \(String(format: "%6.2f", pm))ms")
+        print("  Total:   \(String(format: "%6.2f", ym + pm))ms")
+        return (ym, pm)
+    }
+
+    // Load all model variants
+    let yoloALL  = try await loadModel("yolo11s-seg.mlpackage", .all)
+    let poseALL  = try await loadModel("rtmpose.mlpackage", .all)
+    let poseFP16 = try await loadModel("rtmpose_fp16.mlpackage", .all)
+    let poseCPU  = try await loadModel("rtmpose.mlpackage", .cpuOnly)
+    let poseCNE  = try await loadModel("rtmpose.mlpackage", .cpuAndNeuralEngine)
+    let fp16CNE  = try await loadModel("rtmpose_fp16.mlpackage", .cpuAndNeuralEngine)
 
     let yoloIn = yoloALL.modelDescription.inputDescriptionsByName.keys.first!
     let yoloFP = try MLDictionaryFeatureProvider(dictionary: [
@@ -50,64 +78,35 @@ func runStandaloneBench() async throws {
         "input_1": MLFeatureValue(multiArray: poseArr)
     ])
 
-    // Preallocate output backings for RTMPose
-    let poseOutNames = Array(poseALL.modelDescription.outputDescriptionsByName.keys).sorted()
-    let outX = try MLMultiArray(shape: [1, 133, 576], dataType: .float32)
-    let outY = try MLMultiArray(shape: [1, 133, 768], dataType: .float32)
-    let poseOpts = MLPredictionOptions()
-    poseOpts.outputBackings = [poseOutNames[0]: outX, poseOutNames[1]: outY]
-
     // ==========================================
     print("=== Standalone async (200 iters) ===\n")
     report("YOLO (ALL)",                    try await benchAsync(yoloALL, yoloFP))
-    report("RTMPose (ALL)",                 try await benchAsync(poseALL, poseFP))
+    report("RTMPose fp32 (ALL)",            try await benchAsync(poseALL, poseFP))
+    report("RTMPose fp16 (ALL)",            try await benchAsync(poseFP16, poseFP))
+    report("RTMPose fp32 (CPU only)",       try await benchAsync(poseCPU, poseFP))
+    report("RTMPose fp32 (CPU+NE)",         try await benchAsync(poseCNE, poseFP))
+    report("RTMPose fp16 (CPU+NE)",         try await benchAsync(fp16CNE, poseFP))
 
     // ==========================================
-    print("\n=== Alternating async: YOLO → RTMPose (200 iters) ===\n")
-    for _ in 0..<10 {
-        let _ = try await yoloALL.prediction(from: yoloFP)
-        let _ = try await poseALL.prediction(from: poseFP)
-    }
-    var aYT = [Double](), aPT = [Double]()
-    for _ in 0..<200 {
-        let t0 = CFAbsoluteTimeGetCurrent()
-        let _ = try await yoloALL.prediction(from: yoloFP)
-        let t1 = CFAbsoluteTimeGetCurrent()
-        let _ = try await poseALL.prediction(from: poseFP)
-        let t2 = CFAbsoluteTimeGetCurrent()
-        aYT.append(t1 - t0); aPT.append(t2 - t1)
-    }
-    let aym = median(aYT) * 1000, apm = median(aPT) * 1000
-    print("  YOLO:    \(String(format: "%6.2f", aym))ms")
-    print("  RTMPose: \(String(format: "%6.2f", apm))ms")
-    print("  Total:   \(String(format: "%6.2f", aym + apm))ms")
+    print("\n=== Alternating benchmarks ===")
 
-    // ==========================================
-    print("\n=== Alternating async + outputBackings (200 iters) ===\n")
-    for _ in 0..<10 {
-        let _ = try await yoloALL.prediction(from: yoloFP)
-        let _ = try await poseALL.prediction(from: poseFP, options: poseOpts)
-    }
-    var abYT = [Double](), abPT = [Double]()
-    for _ in 0..<200 {
-        let t0 = CFAbsoluteTimeGetCurrent()
-        let _ = try await yoloALL.prediction(from: yoloFP)
-        let t1 = CFAbsoluteTimeGetCurrent()
-        let _ = try await poseALL.prediction(from: poseFP, options: poseOpts)
-        let t2 = CFAbsoluteTimeGetCurrent()
-        abYT.append(t1 - t0); abPT.append(t2 - t1)
-    }
-    let abym = median(abYT) * 1000, abpm = median(abPT) * 1000
-    print("  YOLO:    \(String(format: "%6.2f", abym))ms")
-    print("  RTMPose: \(String(format: "%6.2f", abpm))ms")
-    print("  Total:   \(String(format: "%6.2f", abym + abpm))ms")
+    let (_, baseP) = try await alternatingBench(
+        yoloALL, yoloFP, poseALL, poseFP,
+        label: "YOLO(ALL) → Pose fp32(ALL) [baseline]")
 
-    // ==========================================
-    let ym = median(try await benchAsync(yoloALL, yoloFP)) * 1000
-    let pm = median(try await benchAsync(poseALL, poseFP)) * 1000
-    print("\n=== Summary ===\n")
-    print("  Standalone sum:             \(String(format: "%.1f", ym + pm))ms")
-    print("  Alternating async:          \(String(format: "%.1f", aym + apm))ms")
-    print("  Alternating async+backings: \(String(format: "%.1f", abym + abpm))ms")
-    print("  Previous sync alternating:  ~35-37ms (for reference)")
+    try await alternatingBench(
+        yoloALL, yoloFP, poseFP16, poseFP,
+        label: "YOLO(ALL) → Pose fp16(ALL)")
+
+    try await alternatingBench(
+        yoloALL, yoloFP, fp16CNE, poseFP,
+        label: "YOLO(ALL) → Pose fp16(CPU+NE)")
+
+    try await alternatingBench(
+        yoloALL, yoloFP, poseCPU, poseFP,
+        label: "YOLO(ALL) → Pose fp32(CPU only)")
+
+    try await alternatingBench(
+        yoloALL, yoloFP, poseCNE, poseFP,
+        label: "YOLO(ALL) → Pose fp32(CPU+NE)")
 }
