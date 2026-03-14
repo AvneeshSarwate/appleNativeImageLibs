@@ -4,6 +4,31 @@ import Vision
 import CoreVideo
 import SwiftUI
 
+/// Thread-safe config snapshot read from videoQueue
+final class PipelineConfig: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _enableSeg = true
+    private var _enableBody = true
+    private var _enableHands = true
+    private var _enableFace = true
+    private var _segQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced
+
+    var enableSeg: Bool { lock.withLock { _enableSeg } }
+    var enableBody: Bool { lock.withLock { _enableBody } }
+    var enableHands: Bool { lock.withLock { _enableHands } }
+    var enableFace: Bool { lock.withLock { _enableFace } }
+    var segQuality: VNGeneratePersonSegmentationRequest.QualityLevel { lock.withLock { _segQuality } }
+
+    func update(seg: Bool, body: Bool, hands: Bool, face: Bool,
+                quality: VNGeneratePersonSegmentationRequest.QualityLevel) {
+        lock.withLock {
+            _enableSeg = seg; _enableBody = body
+            _enableHands = hands; _enableFace = face
+            _segQuality = quality
+        }
+    }
+}
+
 @MainActor
 class VisionPipelineEngine: NSObject, ObservableObject {
     @Published var latestResult: VisionFrameResult?
@@ -17,12 +42,21 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     @Published var handMs: Double = 0
     @Published var faceMs: Double = 0
 
-    // Toggles
-    @Published var enableSeg = true
-    @Published var enableBody = true
-    @Published var enableHands = true
-    @Published var enableFace = true
-    @Published var segQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced
+    // UI-bound toggles
+    @Published var enableSeg = true { didSet { syncConfig() } }
+    @Published var enableBody = true { didSet { syncConfig() } }
+    @Published var enableHands = true { didSet { syncConfig() } }
+    @Published var enableFace = true { didSet { syncConfig() } }
+    @Published var segQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced { didSet { syncConfig() } }
+
+    // Thread-safe config for videoQueue
+    let config = PipelineConfig()
+
+    private func syncConfig() {
+        config.update(seg: enableSeg, body: enableBody,
+                      hands: enableHands, face: enableFace,
+                      quality: segQuality)
+    }
 
     private var captureSession: AVCaptureSession?
     private let videoQueue = DispatchQueue(label: "vision-video-capture")
@@ -86,21 +120,19 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         let imgW = CVPixelBufferGetWidth(pixelBuffer)
         let imgH = CVPixelBufferGetHeight(pixelBuffer)
 
-        // Read toggles (safe to read atomically from nonisolated context in Swift 5 mode)
-        let doSeg = enableSeg
-        let doBody = enableBody
-        let doHands = enableHands
-        let doFace = enableFace
-        let quality = segQuality
+        // Snapshot config
+        let doSeg = config.enableSeg
+        let doBody = config.enableBody
+        let doHands = config.enableHands
+        let doFace = config.enableFace
+        let quality = config.segQuality
 
-        // Update quality if changed
         if segRequest.qualityLevel != quality {
             segRequest.qualityLevel = quality
         }
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
 
-        // Time each request individually
         var tSeg: Double = 0, tBody: Double = 0, tHand: Double = 0, tFace: Double = 0
 
         var maskPB: CVPixelBuffer? = nil
