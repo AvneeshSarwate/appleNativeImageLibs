@@ -64,7 +64,9 @@ func runStandaloneBench() async throws {
 
     // Load all model variants
     let yoloALL  = try await loadModel("yolo11s-seg.mlpackage", .all)
+    let yoloCG   = try await loadModel("yolo11s-seg.mlpackage", .cpuAndGPU)
     let poseALL  = try await loadModel("rtmpose.mlpackage", .all)
+    let poseCG   = try await loadModel("rtmpose.mlpackage", .cpuAndGPU)
     let poseFP16 = try await loadModel("rtmpose_fp16.mlpackage", .all)
     let poseCPU  = try await loadModel("rtmpose.mlpackage", .cpuOnly)
     let poseCNE  = try await loadModel("rtmpose.mlpackage", .cpuAndNeuralEngine)
@@ -81,32 +83,19 @@ func runStandaloneBench() async throws {
     // ==========================================
     print("=== Standalone async (200 iters) ===\n")
     report("YOLO (ALL)",                    try await benchAsync(yoloALL, yoloFP))
+    report("YOLO (CPU+GPU)",               try await benchAsync(yoloCG, yoloFP))
     report("RTMPose fp32 (ALL)",            try await benchAsync(poseALL, poseFP))
-    report("RTMPose fp16 (ALL)",            try await benchAsync(poseFP16, poseFP))
-    report("RTMPose fp32 (CPU only)",       try await benchAsync(poseCPU, poseFP))
-    report("RTMPose fp32 (CPU+NE)",         try await benchAsync(poseCNE, poseFP))
-    report("RTMPose fp16 (CPU+NE)",         try await benchAsync(fp16CNE, poseFP))
+    report("RTMPose fp32 (CPU+GPU)",        try await benchAsync(poseCG, poseFP))
 
     // ==========================================
     print("\n=== Alternating benchmarks ===")
 
     let (_, baseP) = try await alternatingBench(
         yoloALL, yoloFP, poseALL, poseFP,
-        label: "YOLO(ALL) → Pose fp32(ALL) [baseline]")
+        label: "YOLO(ALL) → Pose(ALL) [ANE→GPU baseline]")
 
     try await alternatingBench(
-        yoloALL, yoloFP, poseFP16, poseFP,
-        label: "YOLO(ALL) → Pose fp16(ALL)")
+        yoloCG, yoloFP, poseCG, poseFP,
+        label: "YOLO(CPU+GPU) → Pose(CPU+GPU) [all-GPU]")
 
-    try await alternatingBench(
-        yoloALL, yoloFP, fp16CNE, poseFP,
-        label: "YOLO(ALL) → Pose fp16(CPU+NE)")
-
-    try await alternatingBench(
-        yoloALL, yoloFP, poseCPU, poseFP,
-        label: "YOLO(ALL) → Pose fp32(CPU only)")
-
-    try await alternatingBench(
-        yoloALL, yoloFP, poseCNE, poseFP,
-        label: "YOLO(ALL) → Pose fp32(CPU+NE)")
 }

@@ -10,8 +10,8 @@ import Accelerate
 let YOLO_SIZE = 640
 let YOLO_CONF_THRESH: Float = 0.25
 let PERSON_CLASS = 0
-let RTM_H = 384
-let RTM_W = 288
+let RTM_H = 256
+let RTM_W = 192
 let SIMCC_SPLIT: Float = 2.0
 let FRAME_W = 1920
 let FRAME_H = 1080
@@ -429,10 +429,19 @@ func runPipeline() async throws {
         try await runStandaloneBench()
         return
     }
+    if args.count >= 2 && args[1] == "--two-process" {
+        try await runTwoProcessBench()
+        return
+    }
+    if args.count >= 2 && args[1] == "--rtm-worker" {
+        try await runRTMWorker()
+        return
+    }
 
     guard args.count >= 2 else {
         print("Usage: CoreMLPipeline <video-path> [num-frames]")
         print("       CoreMLPipeline --bench")
+        print("       CoreMLPipeline --two-process")
         return
     }
     let videoPath = args[1]
@@ -442,182 +451,199 @@ func runPipeline() async throws {
     // Load and compile models
     print("Compiling models...")
     let yoloURL = URL(fileURLWithPath: "\(modelDir)/yolo11s-seg.mlpackage")
-    let poseURL = URL(fileURLWithPath: "\(modelDir)/rtmpose.mlpackage")
+    let poseURL = URL(fileURLWithPath: "\(modelDir)/dwpose_m.mlpackage")
 
     let yoloCompiled = try await MLModel.compileModel(at: yoloURL)
     let poseCompiled = try await MLModel.compileModel(at: poseURL)
 
-        let config = MLModelConfiguration()
-        config.computeUnits = .all
-        let yoloModel = try MLModel(contentsOf: yoloCompiled, configuration: config)
-        let poseModel = try MLModel(contentsOf: poseCompiled, configuration: config)
+    // YOLO on ANE, DWPose-m on GPU — different hardware, run in parallel
+    let yoloCfg = MLModelConfiguration()
+    yoloCfg.computeUnits = .all  // ANE for fp16 model
+    let yoloModel = try MLModel(contentsOf: yoloCompiled, configuration: yoloCfg)
 
-        let yoloOutNames = Array(yoloModel.modelDescription.outputDescriptionsByName.keys).sorted()
-        let yoloInName   = yoloModel.modelDescription.inputDescriptionsByName.keys.first!
-        let poseOutNames = Array(poseModel.modelDescription.outputDescriptionsByName.keys).sorted()
-        let poseInName   = poseModel.modelDescription.inputDescriptionsByName.keys.first!
+    let poseCfg = MLModelConfiguration()
+    poseCfg.computeUnits = .cpuAndGPU  // GPU for fp32 model
+    let poseModel = try MLModel(contentsOf: poseCompiled, configuration: poseCfg)
 
-        print("  YOLO input: \(yoloInName), outputs: \(yoloOutNames)")
-        print("  Pose input: \(poseInName), outputs: \(poseOutNames)")
+    let yoloOutNames = Array(yoloModel.modelDescription.outputDescriptionsByName.keys).sorted()
+    let yoloInName   = yoloModel.modelDescription.inputDescriptionsByName.keys.first!
+    let poseOutNames = Array(poseModel.modelDescription.outputDescriptionsByName.keys).sorted()
+    let poseInName   = poseModel.modelDescription.inputDescriptionsByName.keys.first!
 
-        // Preallocate YOLO letterbox buffer
-        let yoloPB = makePixelBuffer(YOLO_SIZE, YOLO_SIZE)
+    print("  YOLO (\(yoloCfg.computeUnits)) input: \(yoloInName), outputs: \(yoloOutNames)")
+    print("  Pose (\(poseCfg.computeUnits)) input: \(poseInName), outputs: \(poseOutNames)")
 
-        // Start ffmpeg reader
-        print("Starting ffmpeg (\(FRAME_W)x\(FRAME_H) BGRA)...")
-        let reader = FrameReader(videoPath: videoPath)
-        try reader.start()
+    // Preallocate YOLO letterbox buffer
+    let yoloPB = makePixelBuffer(YOLO_SIZE, YOLO_SIZE)
 
-        // --- Pipelined frame reader (1-frame overlap) ---
-        var pendingFrame: Data?
-        let frameLock = NSLock()
-        let frameReady = DispatchSemaphore(value: 0)
-        let readQueue = DispatchQueue(label: "reader", qos: .userInitiated)
+    // Start ffmpeg reader
+    print("Starting ffmpeg (\(FRAME_W)x\(FRAME_H) BGRA)...")
+    let reader = FrameReader(videoPath: videoPath)
+    try reader.start()
 
-        func kickRead() {
-            readQueue.async {
-                let d = reader.readFrame()
-                frameLock.lock()
-                pendingFrame = d
-                frameLock.unlock()
-                frameReady.signal()
-            }
-        }
+    // --- Pipelined frame reader (1-frame overlap) ---
+    var pendingFrame: Data?
+    let frameLock = NSLock()
+    let frameReady = DispatchSemaphore(value: 0)
+    let readQueue = DispatchQueue(label: "reader", qos: .userInitiated)
 
-        func takeFrame() -> Data? {
-            frameReady.wait()
+    func kickRead() {
+        readQueue.async {
+            let d = reader.readFrame()
             frameLock.lock()
-            let d = pendingFrame
-            pendingFrame = nil
+            pendingFrame = d
             frameLock.unlock()
-            return d
+            frameReady.signal()
         }
+    }
 
-        // Warmup
-        print("Warming up (5 frames)...")
+    func takeFrame() -> Data? {
+        frameReady.wait()
+        frameLock.lock()
+        let d = pendingFrame
+        pendingFrame = nil
+        frameLock.unlock()
+        return d
+    }
+
+    // Warmup
+    print("Warming up (5 frames)...")
+    kickRead()
+    for _ in 0..<5 {
+        guard let fd = takeFrame() else { break }
         kickRead()
-        for _ in 0..<5 {
-            guard let fd = takeFrame() else { break }
-            kickRead()
-            letterbox(frameData: fd, into: yoloPB)
-            let inp = try MLDictionaryFeatureProvider(dictionary: [
-                yoloInName: MLFeatureValue(pixelBuffer: yoloPB)
-            ])
-            let _ = try await yoloModel.prediction(from: inp)
+        letterbox(frameData: fd, into: yoloPB)
+        let inp = try MLDictionaryFeatureProvider(dictionary: [
+            yoloInName: MLFeatureValue(pixelBuffer: yoloPB)
+        ])
+        let _ = try await yoloModel.prediction(from: inp)
+    }
+
+    // --- Main processing loop ---
+    // YOLO(ANE) and DWPose-m(GPU) run in PARALLEL on different hardware.
+    // DWPose-m uses the PREVIOUS frame's bbox (1-frame lag).
+    // Mask + keypoints are from the same frame's data, just the crop region
+    // is from the prior YOLO detection.
+    print("Processing \(numFrames) frames (parallel YOLO+Pose, 1-frame bbox lag)...\n")
+
+    var t_wait  = [Double]()
+    var t_frame = [Double]()  // max(YOLO, Pose) = actual frame time
+    var t_yolo  = [Double]()  // YOLO total (pre + inf + post + contour)
+    var t_pose  = [Double]()  // Pose total (pre + inf + decode)
+
+    // Bootstrap: run first frame YOLO-only to get initial bbox
+    kickRead()
+    guard let firstFrame = takeFrame() else {
+        print("No frames"); reader.stop(); return
+    }
+    letterbox(frameData: firstFrame, into: yoloPB)
+    let firstYoloInput = try MLDictionaryFeatureProvider(dictionary: [
+        yoloInName: MLFeatureValue(pixelBuffer: yoloPB)
+    ])
+    let firstYoloPred = try await yoloModel.prediction(from: firstYoloInput)
+    var prevBbox = parseDetections(firstYoloPred, outputNames: yoloOutNames)?.bbox
+    var prevContour: [(Float, Float)]? = nil
+    if let det = parseDetections(firstYoloPred, outputNames: yoloOutNames) {
+        prevContour = decodeContour(det)
+    }
+
+    kickRead()
+
+    for i in 0..<numFrames {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard let frameData = takeFrame() else {
+            print("End of video at frame \(i)")
+            break
         }
-
-        // --- Main processing loop ---
-        print("Processing \(numFrames) frames...\n")
-
-        var t_wait  = [Double]()
-        var t_ypre  = [Double]()
-        var t_yinf  = [Double]()
-        var t_ypost = [Double]()
-        var t_cont  = [Double]()
-        var t_pose  = [Double]()
-        var t_total = [Double]()
+        let tw = CFAbsoluteTimeGetCurrent()
 
         kickRead()
 
-        for i in 0..<numFrames {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            guard let frameData = takeFrame() else {
-                print("End of video at frame \(i)")
-                break
-            }
-            let tw = CFAbsoluteTimeGetCurrent()
+        // Run YOLO and Pose in parallel using structured concurrency
+        // YOLO: preprocess + infer + postprocess + contour (ANE)
+        // Pose: preprocess + infer + decode using prevBbox (GPU)
 
-            kickRead()
+        let currentBbox = prevBbox  // capture for pose task
 
-            // YOLO preprocess
+        async let yoloResult: (Detection?, [(Float, Float)]?, Double) = {
+            let ty0 = CFAbsoluteTimeGetCurrent()
             letterbox(frameData: frameData, into: yoloPB)
-            let t1 = CFAbsoluteTimeGetCurrent()
-
-            // YOLO inference (async)
             let yoloInput = try MLDictionaryFeatureProvider(dictionary: [
                 yoloInName: MLFeatureValue(pixelBuffer: yoloPB)
             ])
             let yoloPred = try await yoloModel.prediction(from: yoloInput)
-            let t2 = CFAbsoluteTimeGetCurrent()
+            let det = parseDetections(yoloPred, outputNames: yoloOutNames)
+            var contour: [(Float, Float)]? = nil
+            if let d = det { contour = decodeContour(d) }
+            let ty1 = CFAbsoluteTimeGetCurrent()
+            return (det, contour, ty1 - ty0)
+        }()
 
-            // YOLO postprocess
-            let detection = parseDetections(yoloPred, outputNames: yoloOutNames)
-            let t3 = CFAbsoluteTimeGetCurrent()
-
-            guard let det = detection else {
-                t_wait.append(tw - t0); t_ypre.append(t1 - tw)
-                t_yinf.append(t2 - t1); t_ypost.append(t3 - t2)
-                t_cont.append(0); t_pose.append(0)
-                t_total.append(t3 - tw)
-                continue
+        async let poseResult: (PoseResult?, Double) = {
+            let tp0 = CFAbsoluteTimeGetCurrent()
+            var result: PoseResult? = nil
+            if let bbox = currentBbox {
+                result = try await runPoseAsync(
+                    model: poseModel, inputName: poseInName,
+                    outputNames: poseOutNames,
+                    frameData: frameData, bbox: bbox)
             }
+            let tp1 = CFAbsoluteTimeGetCurrent()
+            return (result, tp1 - tp0)
+        }()
 
-            // Contour at proto resolution
-            let _ = decodeContour(det)
-            let t4 = CFAbsoluteTimeGetCurrent()
+        // Await both results
+        let (yDet, yContour, yTime) = try await yoloResult
+        let (_, pTime) = try await poseResult
 
-            // RTMPose (async preprocess + infer + decode)
-            let _ = try await runPoseAsync(model: poseModel, inputName: poseInName,
-                                           outputNames: poseOutNames,
-                                           frameData: frameData, bbox: det.bbox)
-            let t5 = CFAbsoluteTimeGetCurrent()
+        let tEnd = CFAbsoluteTimeGetCurrent()
 
-            t_wait.append(tw - t0)
-            t_ypre.append(t1 - tw)
-            t_yinf.append(t2 - t1)
-            t_ypost.append(t3 - t2)
-            t_cont.append(t4 - t3)
-            t_pose.append(t5 - t4)
-            t_total.append(t5 - tw)
+        // Update bbox for next frame
+        if let det = yDet { prevBbox = det.bbox }
+        prevContour = yContour
 
-            if (i + 1) % 50 == 0 {
-                let m = median(t_total) * 1000
-                print("  Frame \(i+1)/\(numFrames) — median \(String(format: "%.1f", m))ms " +
-                      "(\(String(format: "%.1f", 1000/m)) FPS)")
-            }
+        t_wait.append(tw - t0)
+        t_yolo.append(yTime)
+        t_pose.append(pTime)
+        t_frame.append(tEnd - tw)
+
+        if (i + 1) % 50 == 0 {
+            let m = median(t_frame) * 1000
+            print("  Frame \(i+1)/\(numFrames) — median \(String(format: "%.1f", m))ms " +
+                  "(\(String(format: "%.1f", 1000/m)) FPS)")
         }
+    }
 
-        reader.stop()
+    reader.stop()
 
-        // ============================================================================
-        // Report
-        // ============================================================================
-        print("\n" + String(repeating: "=", count: 70))
-        print("Swift CoreML Pipeline — async predictions, 1-frame pipelined read")
-        print(String(repeating: "=", count: 70))
+    // ============================================================================
+    // Report
+    // ============================================================================
+    print("\n" + String(repeating: "=", count: 70))
+    print("Swift CoreML Pipeline — PARALLEL (YOLO on ANE, DWPose-m on GPU)")
+    print("  1-frame bbox lag, 1-frame pipelined read")
+    print(String(repeating: "=", count: 70))
 
-        let totalMed = median(t_total) * 1000
-        let stages: [(String, [Double])] = [
-            ("Frame wait (overlap)",  t_wait),
-            ("YOLO preprocess",       t_ypre),
-            ("YOLO inference",        t_yinf),
-            ("YOLO postprocess",      t_ypost),
-            ("Contour (160px)",       t_cont),
-            ("RTMPose total",         t_pose),
-        ]
+    let frameMed = median(t_frame) * 1000
+    let yoloMed = median(t_yolo) * 1000
+    let poseMed = median(t_pose) * 1000
+    let waitMed = median(t_wait) * 1000
 
-        for (label, arr) in stages {
-            let m = median(arr) * 1000
-            let pct = totalMed > 0 ? m / totalMed * 100 : 0
-            let bar = String(repeating: "#", count: max(0, Int(pct / 2)))
-            print("  \(label.padding(toLength: 24, withPad: " ", startingAt: 0))" +
-                  "\(String(format: "%6.2f", m))ms  (\(String(format: "%4.1f", pct))%)  \(bar)")
-        }
+    print("  Frame wait (overlap)   \(String(format: "%6.2f", waitMed))ms")
+    print("  YOLO total (ANE)       \(String(format: "%6.2f", yoloMed))ms")
+    print("  Pose total (GPU)       \(String(format: "%6.2f", poseMed))ms")
+    print("  Frame time (parallel)  \(String(format: "%6.2f", frameMed))ms  " +
+          "→ \(String(format: "%.1f", 1000/frameMed)) FPS")
+    print("  p95:                   \(String(format: "%.2f", pct95(t_frame) * 1000))ms")
+    print()
+    print("  Sequential would be:   \(String(format: "%.1f", yoloMed + poseMed))ms")
+    print("  Parallel savings:      \(String(format: "%.1f", (yoloMed + poseMed) - frameMed))ms")
 
-        print()
-        print("  Process (excl. wait)   \(String(format: "%6.2f", totalMed))ms " +
-              "→ \(String(format: "%.1f", 1000/totalMed)) FPS")
-        print("  p95:                   \(String(format: "%.2f", pct95(t_total) * 1000))ms")
-
-        let waitMed = median(t_wait) * 1000
-        print("\n  Frame wait median:     \(String(format: "%.2f", waitMed))ms")
-
-        print("\nComparison:")
-        print("  Python CPU baseline:    503.6ms  ( 2.0 FPS)")
-        print("  Python optimized:        52.8ms  (18.9 FPS)")
-        print("  Swift sync (prev):       46.7ms  (21.4 FPS)")
-        print("  Swift async:         \(String(format: "%8.1f", totalMed))ms  " +
-              "(\(String(format: "%.1f", 1000/totalMed)) FPS)")
+    print("\nComparison:")
+    print("  Python CPU baseline:    503.6ms  ( 2.0 FPS)")
+    print("  Swift sequential:        40.6ms  (24.6 FPS)")
+    print("  Swift parallel:      \(String(format: "%8.1f", frameMed))ms  " +
+          "(\(String(format: "%.1f", 1000/frameMed)) FPS)")
 }
 
 // Top-level entry point
