@@ -22,8 +22,18 @@ struct VisionCameraView: View {
             // Info + controls overlay
             VStack {
                 HStack(alignment: .top) {
-                    // Left: toggles
+                    // Left: controls
                     VStack(alignment: .leading, spacing: 6) {
+                        // Camera picker
+                        Picker("Camera", selection: $engine.selectedCameraId) {
+                            ForEach(engine.availableCameras) { cam in
+                                Text(cam.name).tag(cam.id)
+                            }
+                        }
+                        .frame(width: 220)
+
+                        Spacer().frame(height: 2)
+
                         Toggle("Mask", isOn: $engine.enableSeg)
                         if engine.enableSeg {
                             HStack(spacing: 4) {
@@ -40,14 +50,25 @@ struct VisionCameraView: View {
                         Toggle("Body", isOn: $engine.enableBody)
                         Toggle("Hands", isOn: $engine.enableHands)
                         Toggle("Face", isOn: $engine.enableFace)
-                        Divider().background(Color.gray)
+
+                        Spacer().frame(height: 2)
+
                         Toggle("Batch mode", isOn: $engine.batchMode)
+
+                        Spacer().frame(height: 2)
+
+                        Toggle("Syphon out", isOn: $engine.enableSyphon)
+                        if engine.enableSyphon {
+                            HStack {
+                                Text(String(format: "Threshold: %.0f%%", engine.maskThreshold * 100))
+                                Slider(value: $engine.maskThreshold, in: 0...1)
+                                    .frame(width: 120)
+                            }
+                        }
                     }
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.white)
                     .padding(8)
-                    .background(Color.black.opacity(0.6))
-                    .cornerRadius(8)
 
                     Spacer()
 
@@ -65,7 +86,7 @@ struct VisionCameraView: View {
                                 .foregroundColor(.orange)
                         } else {
                             HStack(spacing: 12) {
-                                timingLabel("seg ", engine.segMs, engine.enableSeg)
+                                timingLabel("seg ", engine.segMs, engine.enableSeg || engine.enableSyphon)
                                 timingLabel("body", engine.bodyMs, engine.enableBody)
                             }
                             HStack(spacing: 12) {
@@ -80,11 +101,13 @@ struct VisionCameraView: View {
                             Text(String(format: "%2db %2dh %2df pts", bodyCount, handCount, faceCount))
                                 .foregroundColor(.gray)
                         }
+                        if engine.enableSyphon {
+                            Text("syphon: on")
+                                .foregroundColor(.orange)
+                        }
                     }
                     .font(.system(.caption, design: .monospaced))
                     .padding(8)
-                    .background(Color.black.opacity(0.6))
-                    .cornerRadius(8)
                 }
                 Spacer()
             }
@@ -95,6 +118,9 @@ struct VisionCameraView: View {
         .onChange(of: engine.enableHands) { _ in engine.syncConfig() }
         .onChange(of: engine.enableFace) { _ in engine.syncConfig() }
         .onChange(of: engine.batchMode) { _ in engine.syncConfig() }
+        .onChange(of: engine.enableSyphon) { _ in engine.syncConfig() }
+        .onChange(of: engine.maskThreshold) { _ in engine.syncConfig() }
+        .onChange(of: engine.selectedCameraId) { newId in engine.switchCamera(to: newId) }
         .task {
             do {
                 try engine.start()

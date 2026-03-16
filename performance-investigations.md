@@ -426,6 +426,24 @@ Tested an alternative pipeline using Apple's native Vision framework (`VNGenerat
 - Batching all 4 requests in a single `perform()` call helps (Vision shares image preprocessing)
 - `VNSequenceRequestHandler` provides temporal optimization across frames
 
+### Hardware Profiling (Xcode Instruments, Core ML + Metal System Trace)
+
+Profiled 10 seconds of steady-state with all 4 requests enabled (seg balanced, body, hands, face):
+
+| Channel | Total (10s) | Per frame (~30 FPS) |
+|---------|-------------|---------------------|
+| GPU Compute | 347.95 ms | ~1.2 ms |
+| GPU Vertex | 40.65 ms | ~0.1 ms |
+| GPU Fragment | 38.64 ms | ~0.1 ms |
+| **GPU Total** | **427.24 ms** | **~1.4 ms** |
+
+- **Neural Engine**: solid continuous activity across the full recording — ANE does the heavy lifting
+- **GPU usage is minimal**: ~1.4 ms/frame, ~3% of M1 Max GPU budget at 24 FPS
+- Vertex + Fragment GPU time is from SwiftUI Canvas rendering, not Vision inference
+- The Compute channel (~1.2 ms/frame) is Vision's internal Metal dispatch for parts of the models
+
+**Conclusion: Vision framework is mostly ANE + CPU, with very light GPU touch. Better for TouchDesigner coexistence than initially assumed.**
+
 ### Keypoint Coverage
 - **Body**: 19 joints (comparable to DWPose's 17 body joints, adds neck + root)
 - **Hands**: 21 joints per hand (matches DWPose)
@@ -435,5 +453,5 @@ Tested an alternative pipeline using Apple's native Vision framework (`VNGenerat
 ### Verdict
 - Vision is simpler code (~500 lines, no model files, no preprocessing) but a black box for hardware scheduling
 - **Not suitable if foot keypoints are needed** — must use RTMPose/DWPose for that
-- **Not suitable if GPU headroom matters** — cannot pin to ANE-only like the CoreML pipeline
+- **GPU usage is actually very low** (~1.4 ms/frame) — better for TouchDesigner coexistence than the CoreML pipeline's DWPose-on-GPU config (~7 ms/frame)
 - Useful as a quick baseline or if only body/hand/face tracking is needed without feet

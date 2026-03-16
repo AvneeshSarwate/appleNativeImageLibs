@@ -3,6 +3,8 @@ import AVFoundation
 import Vision
 import CoreVideo
 import SwiftUI
+import Metal
+import Syphon
 
 /// Thread-safe config snapshot read from videoQueue
 final class PipelineConfig: @unchecked Sendable {
@@ -13,6 +15,8 @@ final class PipelineConfig: @unchecked Sendable {
     private var _enableFace = true
     private var _segQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced
     private var _batchMode = false
+    private var _enableSyphon = false
+    private var _maskThreshold: UInt8 = 128
 
     var enableSeg: Bool { lock.withLock { _enableSeg } }
     var enableBody: Bool { lock.withLock { _enableBody } }
@@ -20,16 +24,24 @@ final class PipelineConfig: @unchecked Sendable {
     var enableFace: Bool { lock.withLock { _enableFace } }
     var segQuality: VNGeneratePersonSegmentationRequest.QualityLevel { lock.withLock { _segQuality } }
     var batchMode: Bool { lock.withLock { _batchMode } }
+    var enableSyphon: Bool { lock.withLock { _enableSyphon } }
+    var maskThreshold: UInt8 { lock.withLock { _maskThreshold } }
 
     func update(seg: Bool, body: Bool, hands: Bool, face: Bool,
                 quality: VNGeneratePersonSegmentationRequest.QualityLevel,
-                batch: Bool) {
+                batch: Bool, syphon: Bool, threshold: UInt8) {
         lock.withLock {
             _enableSeg = seg; _enableBody = body
             _enableHands = hands; _enableFace = face
             _segQuality = quality; _batchMode = batch
+            _enableSyphon = syphon; _maskThreshold = threshold
         }
     }
+}
+
+struct CameraInfo: Identifiable, Hashable {
+    let id: String
+    let name: String
 }
 
 @MainActor
@@ -56,7 +68,15 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     @Published var enableHands = true
     @Published var enableFace = true
     @Published var segQualityIndex = 1  // 0=fast, 1=balanced, 2=accurate
-    @Published var batchMode = false    // true = single perform() call, no per-request timing
+    @Published var batchMode = false
+
+    // Syphon + masking
+    @Published var enableSyphon = false
+    @Published var maskThreshold: Float = 0.5  // 0-1, mapped to 0-255
+
+    // Camera selection
+    @Published var availableCameras: [CameraInfo] = []
+    @Published var selectedCameraId: String = ""
 
     // Thread-safe config for videoQueue
     let config = PipelineConfig()
@@ -70,27 +90,35 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         }
         config.update(seg: enableSeg, body: enableBody,
                       hands: enableHands, face: enableFace,
-                      quality: q, batch: batchMode)
+                      quality: q, batch: batchMode,
+                      syphon: enableSyphon,
+                      threshold: UInt8(min(255, max(0, maskThreshold * 255))))
     }
 
     private var captureSession: AVCaptureSession?
+    private var currentInput: AVCaptureDeviceInput?
     private let videoQueue = DispatchQueue(label: "vision-video-capture", qos: .userInitiated)
 
-    // Vision requests — created once, reused across frames (accessed from videoQueue)
+    // Vision requests
     private let segRequest: VNGeneratePersonSegmentationRequest
     private let bodyPoseRequest: VNDetectHumanBodyPoseRequest
     private let handPoseRequest: VNDetectHumanHandPoseRequest
     private let faceLandmarksRequest: VNDetectFaceLandmarksRequest
 
-    // Sequence handlers — one per request, reuse across frames for temporal optimization
+    // Sequence handlers
     private let segSeqHandler = VNSequenceRequestHandler()
     private let bodySeqHandler = VNSequenceRequestHandler()
-    private let handSeqHandler = VNSequenceRequestHandler()
     private let faceSeqHandler = VNSequenceRequestHandler()
 
     // Timing
     private var frameTimes: [Double] = []
-    private let maxFrameTimes = 60
+
+    // Metal + Syphon (accessed from videoQueue)
+    nonisolated(unsafe) private let metalDevice: MTLDevice
+    nonisolated(unsafe) private let commandQueue: MTLCommandQueue
+    nonisolated(unsafe) private var textureCache: CVMetalTextureCache?
+    nonisolated(unsafe) private var syphonServer: SyphonMetalServer?
+    nonisolated(unsafe) private var maskedBuffer: CVPixelBuffer?
 
     override init() {
         segRequest = VNGeneratePersonSegmentationRequest()
@@ -105,18 +133,37 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         faceLandmarksRequest = VNDetectFaceLandmarksRequest()
         faceLandmarksRequest.constellation = .constellation76Points
 
+        metalDevice = MTLCreateSystemDefaultDevice()!
+        commandQueue = metalDevice.makeCommandQueue()!
+
         super.init()
+
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, metalDevice, nil, &textureCache)
+        refreshCameraList()
+    }
+
+    // MARK: - Camera Management
+
+    func refreshCameraList() {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera, .external],
+            mediaType: .video, position: .unspecified)
+        availableCameras = discovery.devices.map { CameraInfo(id: $0.uniqueID, name: $0.localizedName) }
+        if selectedCameraId.isEmpty, let first = availableCameras.first {
+            selectedCameraId = first.id
+        }
     }
 
     func start() throws {
         let session = AVCaptureSession()
         session.sessionPreset = .hd1920x1080
 
-        guard let device = AVCaptureDevice.default(for: .video),
+        guard let device = cameraDevice(for: selectedCameraId),
               let input = try? AVCaptureDeviceInput(device: device)
         else { throw NSError(domain: "Camera", code: 1, userInfo: [NSLocalizedDescriptionKey: "No camera"]) }
 
         session.addInput(input)
+        currentInput = input
 
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -129,9 +176,111 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         isRunning = true
     }
 
+    func switchCamera(to id: String) {
+        guard let session = captureSession,
+              let device = cameraDevice(for: id),
+              let newInput = try? AVCaptureDeviceInput(device: device)
+        else { return }
+
+        session.beginConfiguration()
+        if let old = currentInput { session.removeInput(old) }
+        if session.canAddInput(newInput) {
+            session.addInput(newInput)
+            currentInput = newInput
+            selectedCameraId = id
+        }
+        session.commitConfiguration()
+    }
+
+    private func cameraDevice(for id: String) -> AVCaptureDevice? {
+        AVCaptureDevice(uniqueID: id) ?? AVCaptureDevice.default(for: .video)
+    }
+
     func stop() {
         captureSession?.stopRunning()
+        syphonServer?.stop()
         isRunning = false
+    }
+
+    // MARK: - Syphon
+
+    nonisolated private func ensureSyphonServer() {
+        if syphonServer == nil {
+            syphonServer = SyphonMetalServer(name: "VisionApp", device: metalDevice, options: nil)
+        }
+    }
+
+    nonisolated private func publishMaskedFrame(camera: CVPixelBuffer, mask: CVPixelBuffer) {
+        let threshold = config.maskThreshold
+        let imgW = CVPixelBufferGetWidth(camera)
+        let imgH = CVPixelBufferGetHeight(camera)
+        let maskW = CVPixelBufferGetWidth(mask)
+        let maskH = CVPixelBufferGetHeight(mask)
+
+        // Create or reuse output buffer
+        if maskedBuffer == nil
+            || CVPixelBufferGetWidth(maskedBuffer!) != imgW
+            || CVPixelBufferGetHeight(maskedBuffer!) != imgH {
+            var pb: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, imgW, imgH,
+                                kCVPixelFormatType_32BGRA,
+                                [kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+                                 kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary,
+                                &pb)
+            maskedBuffer = pb
+        }
+        guard let outPB = maskedBuffer else { return }
+
+        CVPixelBufferLockBaseAddress(camera, .readOnly)
+        CVPixelBufferLockBaseAddress(mask, .readOnly)
+        CVPixelBufferLockBaseAddress(outPB, [])
+
+        let camBase = CVPixelBufferGetBaseAddress(camera)!.assumingMemoryBound(to: UInt8.self)
+        let camRowBytes = CVPixelBufferGetBytesPerRow(camera)
+        let maskBase = CVPixelBufferGetBaseAddress(mask)!.assumingMemoryBound(to: UInt8.self)
+        let maskRowBytes = CVPixelBufferGetBytesPerRow(mask)
+        let outBase = CVPixelBufferGetBaseAddress(outPB)!.assumingMemoryBound(to: UInt8.self)
+        let outRowBytes = CVPixelBufferGetBytesPerRow(outPB)
+
+        // Apply mask with nearest-neighbor upscale
+        for y in 0..<imgH {
+            let my = y * maskH / imgH
+            let outRow = outBase.advanced(by: y * outRowBytes)
+            let camRow = camBase.advanced(by: y * camRowBytes)
+            for x in 0..<imgW {
+                let mx = x * maskW / imgW
+                let maskVal = maskBase[my * maskRowBytes + mx]
+                let i = x * 4
+                if maskVal > threshold {
+                    outRow[i] = camRow[i]
+                    outRow[i+1] = camRow[i+1]
+                    outRow[i+2] = camRow[i+2]
+                    outRow[i+3] = 255
+                } else {
+                    outRow[i] = 0; outRow[i+1] = 0; outRow[i+2] = 0; outRow[i+3] = 0
+                }
+            }
+        }
+
+        CVPixelBufferUnlockBaseAddress(camera, .readOnly)
+        CVPixelBufferUnlockBaseAddress(mask, .readOnly)
+        CVPixelBufferUnlockBaseAddress(outPB, [])
+
+        // Publish via Syphon
+        guard let cache = textureCache else { return }
+        var cvTex: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, outPB, nil,
+            .bgra8Unorm, imgW, imgH, 0, &cvTex)
+        guard status == kCVReturnSuccess, let cvTex = cvTex,
+              let texture = CVMetalTextureGetTexture(cvTex),
+              let cmdBuf = commandQueue.makeCommandBuffer()
+        else { return }
+
+        syphonServer?.publishFrameTexture(texture, on: cmdBuf,
+                                           imageRegion: NSRect(x: 0, y: 0, width: imgW, height: imgH),
+                                           flipped: true)
+        cmdBuf.commit()
     }
 
     // MARK: - Process Frame (called on videoQueue)
@@ -141,13 +290,13 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         let imgW = CVPixelBufferGetWidth(pixelBuffer)
         let imgH = CVPixelBufferGetHeight(pixelBuffer)
 
-        // Snapshot config
         let doSeg = config.enableSeg
         let doBody = config.enableBody
         let doHands = config.enableHands
         let doFace = config.enableFace
         let quality = config.segQuality
         let batch = config.batchMode
+        let doSyphon = config.enableSyphon
 
         if segRequest.qualityLevel != quality {
             segRequest.qualityLevel = quality
@@ -160,9 +309,8 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         var faces: [FaceLandmarkData] = []
 
         if batch {
-            // Batched: single perform() call, Vision can share image preprocessing
             var requests: [VNRequest] = []
-            if doSeg { requests.append(segRequest) }
+            if doSeg || doSyphon { requests.append(segRequest) }
             if doBody { requests.append(bodyPoseRequest) }
             if doHands { requests.append(handPoseRequest) }
             if doFace { requests.append(faceLandmarksRequest) }
@@ -172,15 +320,15 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                 try? handler.perform(requests)
             }
 
-            if doSeg {
+            if doSeg || doSyphon {
                 maskPB = (segRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
             }
             if doBody { bodies = extractBodyPoses(imgW: imgW, imgH: imgH) }
             if doHands { hands = extractHandPoses(imgW: imgW, imgH: imgH) }
             if doFace { faces = extractFaceLandmarks(imgW: imgW, imgH: imgH) }
         } else {
-            // Individual: separate perform() calls with per-request timing
-            if doSeg {
+            // Segmentation needed for both viz and syphon
+            if doSeg || doSyphon {
                 let s = CFAbsoluteTimeGetCurrent()
                 try? segSeqHandler.perform([segRequest], on: pixelBuffer)
                 tSeg = (CFAbsoluteTimeGetCurrent() - s) * 1000
@@ -196,7 +344,8 @@ class VisionPipelineEngine: NSObject, ObservableObject {
 
             if doHands {
                 let s = CFAbsoluteTimeGetCurrent()
-                try? handSeqHandler.perform([handPoseRequest], on: pixelBuffer)
+                let handHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+                try? handHandler.perform([handPoseRequest])
                 tHand = (CFAbsoluteTimeGetCurrent() - s) * 1000
                 hands = extractHandPoses(imgW: imgW, imgH: imgH)
             }
@@ -209,11 +358,20 @@ class VisionPipelineEngine: NSObject, ObservableObject {
             }
         }
 
+        // Syphon output
+        if doSyphon, let mask = maskPB {
+            ensureSyphonServer()
+            publishMaskedFrame(camera: pixelBuffer, mask: mask)
+        } else if !doSyphon, syphonServer != nil {
+            syphonServer?.stop()
+            syphonServer = nil
+        }
+
         let tEnd = CFAbsoluteTimeGetCurrent()
         let frameMs = (tEnd - t0) * 1000
 
         let result = VisionFrameResult(
-            maskPixelBuffer: maskPB,
+            maskPixelBuffer: doSeg ? maskPB : nil,
             bodyPoses: bodies,
             handPoses: hands,
             faceLandmarks: faces,
