@@ -27,9 +27,24 @@ baselines/
 # Swift build artifacts
 swift-pipeline/.build/
 swift-pipeline/CoreMLPipeline
+vision-standalone/.build/
+
+# Syphon build artifacts
+Syphon-Framework/build/
+
+# Dist bundles (rebuilt by bundle.sh)
+swift-pipeline/dist/
+vision-standalone/dist/
 
 # macOS
 .DS_Store
 
+# Claude Code
+.claude/
+
 # Numpy artifacts
 *.npy
+
+# Xcode
+*.build/
+DerivedData/
