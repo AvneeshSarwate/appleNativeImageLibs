@@ -102,7 +102,7 @@ struct VisionCameraView: View {
                                 .foregroundColor(.gray)
                         }
                         if engine.enableSyphon {
-                            Text("syphon: on")
+                            Text("syphon: \"VisionApp\"")
                                 .foregroundColor(.orange)
                         }
                     }

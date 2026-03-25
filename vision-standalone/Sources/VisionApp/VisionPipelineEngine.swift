@@ -10,9 +10,9 @@ import Syphon
 final class PipelineConfig: @unchecked Sendable {
     private let lock = NSLock()
     private var _enableSeg = true
-    private var _enableBody = true
-    private var _enableHands = true
-    private var _enableFace = true
+    private var _enableBody = false
+    private var _enableHands = false
+    private var _enableFace = false
     private var _segQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced
     private var _batchMode = false
     private var _enableSyphon = false
@@ -64,9 +64,9 @@ class VisionPipelineEngine: NSObject, ObservableObject {
 
     // UI-bound toggles
     @Published var enableSeg = true
-    @Published var enableBody = true
-    @Published var enableHands = true
-    @Published var enableFace = true
+    @Published var enableBody = false
+    @Published var enableHands = false
+    @Published var enableFace = false
     @Published var segQualityIndex = 1  // 0=fast, 1=balanced, 2=accurate
     @Published var batchMode = false
 

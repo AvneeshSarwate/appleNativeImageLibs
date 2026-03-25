@@ -40,14 +40,14 @@ There are two build projects due to Swift runtime compatibility:
 
 The standalone build exists because Xcode 16.2 / Swift 6.0 emits Foundation symbols that only exist on macOS 14+. The `vision-standalone/` project sets its deployment target to macOS 12, so the binary runs on Monterey and later.
 
-**To build for distribution (macOS 12+):**
+**To build and zip for distribution (macOS 12+):**
 
 ```bash
 cd vision-standalone
 ./bundle.sh
 ```
 
-Creates `dist/` with the binary + Syphon framework. Zip and send.
+This auto-syncs sources from `swift-pipeline/`, patches macOS 14 APIs, builds, and produces a versioned zip (e.g. `VisionApp-v3.zip`). Version auto-increments from the `VERSION` file each build. Just send the zip.
 
 **To build for local dev (macOS 14+):**
 
@@ -57,4 +57,4 @@ swift build -c release
 .build/release/VisionApp
 ```
 
-Both projects share the same VisionApp source code. When editing, modify the files in `swift-pipeline/Sources/VisionApp/` and copy them to `vision-standalone/Sources/VisionApp/` before bundling. The only difference is `.external` vs `.externalUnknown` for the camera device type (macOS 14+ renamed it).
+Edit source files in `swift-pipeline/Sources/VisionApp/` — `bundle.sh` copies them automatically.

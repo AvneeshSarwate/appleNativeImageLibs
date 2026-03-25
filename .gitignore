@@ -35,6 +35,7 @@ Syphon-Framework/build/
 # Dist bundles (rebuilt by bundle.sh)
 swift-pipeline/dist/
 vision-standalone/dist/
+vision-standalone/VisionApp-v*.zip
 
 # macOS
 .DS_Store
