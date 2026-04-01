@@ -47,6 +47,7 @@ struct VisionCameraView: View {
                                 }
                             }
                         }
+                        Toggle("Contours", isOn: $engine.enableContours)
                         Toggle("Body", isOn: $engine.enableBody)
                         Toggle("Hands", isOn: $engine.enableHands)
                         Toggle("Face", isOn: $engine.enableFace)
@@ -86,13 +87,14 @@ struct VisionCameraView: View {
                                 .foregroundColor(.orange)
                         } else {
                             HStack(spacing: 12) {
-                                timingLabel("seg ", engine.segMs, engine.enableSeg || engine.enableSyphon)
+                                timingLabel("seg ", engine.segMs, engine.enableSeg || engine.enableSyphon || engine.enableContours)
                                 timingLabel("body", engine.bodyMs, engine.enableBody)
                             }
                             HStack(spacing: 12) {
                                 timingLabel("hand", engine.handMs, engine.enableHands)
                                 timingLabel("face", engine.faceMs, engine.enableFace)
                             }
+                            timingLabel("cntr", engine.contourMs, engine.enableContours)
                         }
                         if let r = engine.latestResult {
                             let bodyCount = r.bodyPoses.first?.joints.count ?? 0
@@ -114,6 +116,7 @@ struct VisionCameraView: View {
             .padding()
         }
         .onChange(of: engine.enableSeg) { _ in engine.syncConfig() }
+        .onChange(of: engine.enableContours) { _ in engine.syncConfig() }
         .onChange(of: engine.enableBody) { _ in engine.syncConfig() }
         .onChange(of: engine.enableHands) { _ in engine.syncConfig() }
         .onChange(of: engine.enableFace) { _ in engine.syncConfig() }

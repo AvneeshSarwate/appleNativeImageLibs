@@ -3,6 +3,7 @@ import CoreVideo
 
 struct VisionFrameResult {
     let maskPixelBuffer: CVPixelBuffer?
+    let contourPath: CGPath?
     let bodyPoses: [BodyPoseData]
     let handPoses: [HandPoseData]
     let faceLandmarks: [FaceLandmarkData]

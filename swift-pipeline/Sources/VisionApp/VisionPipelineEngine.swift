@@ -17,6 +17,7 @@ final class PipelineConfig: @unchecked Sendable {
     private var _batchMode = false
     private var _enableSyphon = false
     private var _maskThreshold: UInt8 = 128
+    private var _enableContours = false
 
     var enableSeg: Bool { lock.withLock { _enableSeg } }
     var enableBody: Bool { lock.withLock { _enableBody } }
@@ -26,15 +27,17 @@ final class PipelineConfig: @unchecked Sendable {
     var batchMode: Bool { lock.withLock { _batchMode } }
     var enableSyphon: Bool { lock.withLock { _enableSyphon } }
     var maskThreshold: UInt8 { lock.withLock { _maskThreshold } }
+    var enableContours: Bool { lock.withLock { _enableContours } }
 
     func update(seg: Bool, body: Bool, hands: Bool, face: Bool,
                 quality: VNGeneratePersonSegmentationRequest.QualityLevel,
-                batch: Bool, syphon: Bool, threshold: UInt8) {
+                batch: Bool, syphon: Bool, threshold: UInt8, contours: Bool) {
         lock.withLock {
             _enableSeg = seg; _enableBody = body
             _enableHands = hands; _enableFace = face
             _segQuality = quality; _batchMode = batch
             _enableSyphon = syphon; _maskThreshold = threshold
+            _enableContours = contours
         }
     }
 }
@@ -56,10 +59,12 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     @Published var bodyMs: Double = 0
     @Published var handMs: Double = 0
     @Published var faceMs: Double = 0
+    @Published var contourMs: Double = 0
     private var segHistory: [Double] = []
     private var bodyHistory: [Double] = []
     private var handHistory: [Double] = []
     private var faceHistory: [Double] = []
+    private var contourHistory: [Double] = []
     private let avgWindow = 10
 
     // UI-bound toggles
@@ -67,6 +72,7 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     @Published var enableBody = false
     @Published var enableHands = false
     @Published var enableFace = false
+    @Published var enableContours = false
     @Published var segQualityIndex = 1  // 0=fast, 1=balanced, 2=accurate
     @Published var batchMode = false
 
@@ -92,7 +98,8 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                       hands: enableHands, face: enableFace,
                       quality: q, batch: batchMode,
                       syphon: enableSyphon,
-                      threshold: UInt8(min(255, max(0, maskThreshold * 255))))
+                      threshold: UInt8(min(255, max(0, maskThreshold * 255))),
+                      contours: enableContours)
     }
 
     private var captureSession: AVCaptureSession?
@@ -104,6 +111,7 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     private let bodyPoseRequest: VNDetectHumanBodyPoseRequest
     private let handPoseRequest: VNDetectHumanHandPoseRequest
     private let faceLandmarksRequest: VNDetectFaceLandmarksRequest
+    private let contourRequest: VNDetectContoursRequest
 
     // Sequence handlers
     private let segSeqHandler = VNSequenceRequestHandler()
@@ -132,6 +140,9 @@ class VisionPipelineEngine: NSObject, ObservableObject {
 
         faceLandmarksRequest = VNDetectFaceLandmarksRequest()
         faceLandmarksRequest.constellation = .constellation76Points
+
+        contourRequest = VNDetectContoursRequest()
+        contourRequest.contrastAdjustment = 2.0
 
         metalDevice = MTLCreateSystemDefaultDevice()!
         commandQueue = metalDevice.makeCommandQueue()!
@@ -294,6 +305,7 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         let doBody = config.enableBody
         let doHands = config.enableHands
         let doFace = config.enableFace
+        let doContours = config.enableContours
         let quality = config.segQuality
         let batch = config.batchMode
         let doSyphon = config.enableSyphon
@@ -302,15 +314,16 @@ class VisionPipelineEngine: NSObject, ObservableObject {
             segRequest.qualityLevel = quality
         }
 
-        var tSeg: Double = 0, tBody: Double = 0, tHand: Double = 0, tFace: Double = 0
+        var tSeg: Double = 0, tBody: Double = 0, tHand: Double = 0, tFace: Double = 0, tContour: Double = 0
         var maskPB: CVPixelBuffer? = nil
+        var contourPath: CGPath? = nil
         var bodies: [BodyPoseData] = []
         var hands: [HandPoseData] = []
         var faces: [FaceLandmarkData] = []
 
         if batch {
             var requests: [VNRequest] = []
-            if doSeg || doSyphon { requests.append(segRequest) }
+            if doSeg || doSyphon || doContours { requests.append(segRequest) }
             if doBody { requests.append(bodyPoseRequest) }
             if doHands { requests.append(handPoseRequest) }
             if doFace { requests.append(faceLandmarksRequest) }
@@ -320,15 +333,15 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                 try? handler.perform(requests)
             }
 
-            if doSeg || doSyphon {
+            if doSeg || doSyphon || doContours {
                 maskPB = (segRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
             }
             if doBody { bodies = extractBodyPoses(imgW: imgW, imgH: imgH) }
             if doHands { hands = extractHandPoses(imgW: imgW, imgH: imgH) }
             if doFace { faces = extractFaceLandmarks(imgW: imgW, imgH: imgH) }
         } else {
-            // Segmentation needed for both viz and syphon
-            if doSeg || doSyphon {
+            // Segmentation needed for viz, syphon, or contours
+            if doSeg || doSyphon || doContours {
                 let s = CFAbsoluteTimeGetCurrent()
                 try? segSeqHandler.perform([segRequest], on: pixelBuffer)
                 tSeg = (CFAbsoluteTimeGetCurrent() - s) * 1000
@@ -358,6 +371,40 @@ class VisionPipelineEngine: NSObject, ObservableObject {
             }
         }
 
+        // Contour detection on mask (border pixels zeroed to exclude frame edges)
+        if doContours, let mask = maskPB {
+            let s = CFAbsoluteTimeGetCurrent()
+            let mW = CVPixelBufferGetWidth(mask)
+            let mH = CVPixelBufferGetHeight(mask)
+            var paddedMask: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, mW, mH,
+                                kCVPixelFormatType_OneComponent8, nil, &paddedMask)
+            if let pm = paddedMask {
+                CVPixelBufferLockBaseAddress(mask, .readOnly)
+                CVPixelBufferLockBaseAddress(pm, [])
+                let src = CVPixelBufferGetBaseAddress(mask)!.assumingMemoryBound(to: UInt8.self)
+                let srcStride = CVPixelBufferGetBytesPerRow(mask)
+                let dst = CVPixelBufferGetBaseAddress(pm)!.assumingMemoryBound(to: UInt8.self)
+                let dstStride = CVPixelBufferGetBytesPerRow(pm)
+                // Zero fill, then copy interior (skip 1px border)
+                memset(dst, 0, dstStride * mH)
+                for y in 1..<(mH - 1) {
+                    memcpy(dst.advanced(by: y * dstStride + 1),
+                           src.advanced(by: y * srcStride + 1),
+                           mW - 2)
+                }
+                CVPixelBufferUnlockBaseAddress(mask, .readOnly)
+                CVPixelBufferUnlockBaseAddress(pm, [])
+
+                let contourHandler = VNImageRequestHandler(cvPixelBuffer: pm, options: [:])
+                try? contourHandler.perform([contourRequest])
+                tContour = (CFAbsoluteTimeGetCurrent() - s) * 1000
+                if let obs = contourRequest.results?.first as? VNContoursObservation {
+                    contourPath = obs.normalizedPath
+                }
+            }
+        }
+
         // Syphon output
         if doSyphon, let mask = maskPB {
             ensureSyphonServer()
@@ -372,6 +419,7 @@ class VisionPipelineEngine: NSObject, ObservableObject {
 
         let result = VisionFrameResult(
             maskPixelBuffer: doSeg ? maskPB : nil,
+            contourPath: doContours ? contourPath : nil,
             bodyPoses: bodies,
             handPoses: hands,
             faceLandmarks: faces,
@@ -386,14 +434,17 @@ class VisionPipelineEngine: NSObject, ObservableObject {
             self.bodyHistory.append(tBody)
             self.handHistory.append(tHand)
             self.faceHistory.append(tFace)
+            self.contourHistory.append(tContour)
             if self.segHistory.count > self.avgWindow { self.segHistory.removeFirst() }
             if self.bodyHistory.count > self.avgWindow { self.bodyHistory.removeFirst() }
             if self.handHistory.count > self.avgWindow { self.handHistory.removeFirst() }
             if self.faceHistory.count > self.avgWindow { self.faceHistory.removeFirst() }
+            if self.contourHistory.count > self.avgWindow { self.contourHistory.removeFirst() }
             self.segMs = self.segHistory.reduce(0, +) / Double(self.segHistory.count)
             self.bodyMs = self.bodyHistory.reduce(0, +) / Double(self.bodyHistory.count)
             self.handMs = self.handHistory.reduce(0, +) / Double(self.handHistory.count)
             self.faceMs = self.faceHistory.reduce(0, +) / Double(self.faceHistory.count)
+            self.contourMs = self.contourHistory.reduce(0, +) / Double(self.contourHistory.count)
 
             self.frameTimes.append(frameMs)
             if self.frameTimes.count > self.avgWindow { self.frameTimes.removeFirst() }

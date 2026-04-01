@@ -72,6 +72,23 @@ struct VisionOverlayView: View {
                 }
             }
 
+            // 1.5. Draw contour outlines
+            if let cgPath = r.contourPath {
+                let transform: CGAffineTransform
+                if mirrored {
+                    transform = CGAffineTransform(scaleX: -size.width, y: -size.height)
+                        .concatenating(CGAffineTransform(translationX: size.width, y: size.height))
+                } else {
+                    transform = CGAffineTransform(scaleX: size.width, y: -size.height)
+                        .concatenating(CGAffineTransform(translationX: 0, y: size.height))
+                }
+                var t = transform
+                if let transformed = cgPath.copy(using: &t) {
+                    let path = Path(transformed)
+                    context.stroke(path, with: .color(.white), lineWidth: 2)
+                }
+            }
+
             // 2. Draw body skeletons
             let bodyColors: [Color] = [.red, .yellow, .orange, .orange, .blue, .blue]
             for bodyPose in r.bodyPoses {
