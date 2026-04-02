@@ -371,36 +371,48 @@ class VisionPipelineEngine: NSObject, ObservableObject {
             }
         }
 
-        // Contour detection on mask (border pixels zeroed to exclude frame edges)
+        // Contour detection: blit mask onto larger canvas with 20px zero border,
+        // then remap contour coords back to original mask space
         if doContours, let mask = maskPB {
             let s = CFAbsoluteTimeGetCurrent()
             let mW = CVPixelBufferGetWidth(mask)
             let mH = CVPixelBufferGetHeight(mask)
-            var paddedMask: CVPixelBuffer?
-            CVPixelBufferCreate(kCFAllocatorDefault, mW, mH,
-                                kCVPixelFormatType_OneComponent8, nil, &paddedMask)
-            if let pm = paddedMask {
+            let border = 20
+            let padW = mW + 2 * border
+            let padH = mH + 2 * border
+
+            var paddedBuf: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, padW, padH,
+                                kCVPixelFormatType_OneComponent8, nil, &paddedBuf)
+            if let pb = paddedBuf {
                 CVPixelBufferLockBaseAddress(mask, .readOnly)
-                CVPixelBufferLockBaseAddress(pm, [])
+                CVPixelBufferLockBaseAddress(pb, [])
                 let src = CVPixelBufferGetBaseAddress(mask)!.assumingMemoryBound(to: UInt8.self)
                 let srcStride = CVPixelBufferGetBytesPerRow(mask)
-                let dst = CVPixelBufferGetBaseAddress(pm)!.assumingMemoryBound(to: UInt8.self)
-                let dstStride = CVPixelBufferGetBytesPerRow(pm)
-                // Zero fill, then copy interior (skip 1px border)
-                memset(dst, 0, dstStride * mH)
-                for y in 1..<(mH - 1) {
-                    memcpy(dst.advanced(by: y * dstStride + 1),
-                           src.advanced(by: y * srcStride + 1),
-                           mW - 2)
+                let dst = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
+                let dstStride = CVPixelBufferGetBytesPerRow(pb)
+                // Zero fill, then blit mask at offset (border, border)
+                memset(dst, 0, dstStride * padH)
+                for y in 0..<mH {
+                    memcpy(dst.advanced(by: (y + border) * dstStride + border),
+                           src.advanced(by: y * srcStride),
+                           mW)
                 }
                 CVPixelBufferUnlockBaseAddress(mask, .readOnly)
-                CVPixelBufferUnlockBaseAddress(pm, [])
+                CVPixelBufferUnlockBaseAddress(pb, [])
 
-                let contourHandler = VNImageRequestHandler(cvPixelBuffer: pm, options: [:])
+                let contourHandler = VNImageRequestHandler(cvPixelBuffer: pb, options: [:])
                 try? contourHandler.perform([contourRequest])
                 tContour = (CFAbsoluteTimeGetCurrent() - s) * 1000
+
                 if let obs = contourRequest.results?.first as? VNContoursObservation {
-                    contourPath = obs.normalizedPath
+                    // Remap from padded normalized coords to original mask normalized coords
+                    var remap = CGAffineTransform(
+                        a: CGFloat(padW) / CGFloat(mW), b: 0,
+                        c: 0, d: CGFloat(padH) / CGFloat(mH),
+                        tx: -CGFloat(border) / CGFloat(mW),
+                        ty: -CGFloat(border) / CGFloat(mH))
+                    contourPath = obs.normalizedPath.copy(using: &remap)
                 }
             }
         }
