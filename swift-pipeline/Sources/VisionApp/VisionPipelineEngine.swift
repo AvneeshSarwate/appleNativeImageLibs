@@ -18,6 +18,7 @@ final class PipelineConfig: @unchecked Sendable {
     private var _enableSyphon = false
     private var _maskThreshold: UInt8 = 128
     private var _enableContours = false
+    private var _enableContourStreaming = false
 
     var enableSeg: Bool { lock.withLock { _enableSeg } }
     var enableBody: Bool { lock.withLock { _enableBody } }
@@ -28,16 +29,19 @@ final class PipelineConfig: @unchecked Sendable {
     var enableSyphon: Bool { lock.withLock { _enableSyphon } }
     var maskThreshold: UInt8 { lock.withLock { _maskThreshold } }
     var enableContours: Bool { lock.withLock { _enableContours } }
+    var enableContourStreaming: Bool { lock.withLock { _enableContourStreaming } }
 
     func update(seg: Bool, body: Bool, hands: Bool, face: Bool,
                 quality: VNGeneratePersonSegmentationRequest.QualityLevel,
-                batch: Bool, syphon: Bool, threshold: UInt8, contours: Bool) {
+                batch: Bool, syphon: Bool, threshold: UInt8, contours: Bool,
+                contourStreaming: Bool) {
         lock.withLock {
             _enableSeg = seg; _enableBody = body
             _enableHands = hands; _enableFace = face
             _segQuality = quality; _batchMode = batch
             _enableSyphon = syphon; _maskThreshold = threshold
             _enableContours = contours
+            _enableContourStreaming = contourStreaming
         }
     }
 }
@@ -65,6 +69,8 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     private var handHistory: [Double] = []
     private var faceHistory: [Double] = []
     private var contourHistory: [Double] = []
+    nonisolated(unsafe) private var contourPointCounts: [Int] = []
+    nonisolated(unsafe) private var contourLineCounts: [Int] = []
     private let avgWindow = 10
 
     // UI-bound toggles
@@ -99,7 +105,8 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                       quality: q, batch: batchMode,
                       syphon: enableSyphon,
                       threshold: UInt8(min(255, max(0, maskThreshold * 255))),
-                      contours: enableContours)
+                      contours: enableContours,
+                      contourStreaming: enableContourStreaming)
     }
 
     private var captureSession: AVCaptureSession?
@@ -127,6 +134,11 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     nonisolated(unsafe) private var textureCache: CVMetalTextureCache?
     nonisolated(unsafe) private var syphonServer: SyphonMetalServer?
     nonisolated(unsafe) private var maskedBuffer: CVPixelBuffer?
+
+    // Contour UDP streaming
+    @Published var enableContourStreaming = false
+    nonisolated(unsafe) private var contourSender: ContourWebSocketServer?
+    nonisolated(unsafe) private var contourFrameNumber: UInt32 = 0
 
     override init() {
         segRequest = VNGeneratePersonSegmentationRequest()
@@ -406,6 +418,26 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                 tContour = (CFAbsoluteTimeGetCurrent() - s) * 1000
 
                 if let obs = contourRequest.results?.first as? VNContoursObservation {
+                    // Log contour point counts
+                    var totalPoints = 0
+                    var contourCount = 0
+                    for top in obs.topLevelContours {
+                        totalPoints += top.pointCount
+                        contourCount += 1
+                        for child in top.childContours {
+                            totalPoints += child.pointCount
+                            contourCount += 1
+                        }
+                    }
+                    contourPointCounts.append(totalPoints)
+                    contourLineCounts.append(contourCount)
+                    if contourPointCounts.count > 10 { contourPointCounts.removeFirst() }
+                    if contourLineCounts.count > 10 { contourLineCounts.removeFirst() }
+                    let avgPts = contourPointCounts.reduce(0, +) / contourPointCounts.count
+                    let avgLines = contourLineCounts.reduce(0, +) / contourLineCounts.count
+                    print("contours: \(avgLines) polylines, \(avgPts) pts avg (this frame: \(contourCount) lines, \(totalPoints) pts)")
+                    fflush(stdout)
+
                     // Remap from padded normalized coords to original mask normalized coords
                     var remap = CGAffineTransform(
                         a: CGFloat(padW) / CGFloat(mW), b: 0,
@@ -413,6 +445,21 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                         tx: -CGFloat(border) / CGFloat(mW),
                         ty: -CGFloat(border) / CGFloat(mH))
                     contourPath = obs.normalizedPath.copy(using: &remap)
+
+                    // Stream contours over UDP
+                    if config.enableContourStreaming {
+                        if self.contourSender == nil {
+                            self.contourSender = ContourWebSocketServer()
+                        }
+                        self.contourSender?.send(obs: obs,
+                                                 padW: padW, padH: padH,
+                                                 mW: mW, mH: mH, border: border,
+                                                 frameNumber: self.contourFrameNumber)
+                        self.contourFrameNumber += 1
+                    } else if self.contourSender != nil {
+                        self.contourSender?.stop()
+                        self.contourSender = nil
+                    }
                 }
             }
         }

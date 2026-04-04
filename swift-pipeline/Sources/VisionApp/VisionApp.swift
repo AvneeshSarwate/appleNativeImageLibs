@@ -58,6 +58,8 @@ struct VisionCameraView: View {
 
                         Spacer().frame(height: 2)
 
+                        Toggle("Stream contours (UDP)", isOn: $engine.enableContourStreaming)
+
                         Toggle("Syphon out", isOn: $engine.enableSyphon)
                         if engine.enableSyphon {
                             HStack {
@@ -121,6 +123,7 @@ struct VisionCameraView: View {
         .onChange(of: engine.enableHands) { _ in engine.syncConfig() }
         .onChange(of: engine.enableFace) { _ in engine.syncConfig() }
         .onChange(of: engine.batchMode) { _ in engine.syncConfig() }
+        .onChange(of: engine.enableContourStreaming) { _ in engine.syncConfig() }
         .onChange(of: engine.enableSyphon) { _ in engine.syncConfig() }
         .onChange(of: engine.maskThreshold) { _ in engine.syncConfig() }
         .onChange(of: engine.selectedCameraId) { newId in engine.switchCamera(to: newId) }
