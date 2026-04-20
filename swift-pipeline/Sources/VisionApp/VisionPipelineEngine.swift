@@ -19,6 +19,7 @@ final class PipelineConfig: @unchecked Sendable {
     private var _maskThreshold: UInt8 = 128
     private var _enableContours = false
     private var _enableContourStreaming = false
+    private var _enableHandStreaming = false
 
     var enableSeg: Bool { lock.withLock { _enableSeg } }
     var enableBody: Bool { lock.withLock { _enableBody } }
@@ -30,11 +31,12 @@ final class PipelineConfig: @unchecked Sendable {
     var maskThreshold: UInt8 { lock.withLock { _maskThreshold } }
     var enableContours: Bool { lock.withLock { _enableContours } }
     var enableContourStreaming: Bool { lock.withLock { _enableContourStreaming } }
+    var enableHandStreaming: Bool { lock.withLock { _enableHandStreaming } }
 
     func update(seg: Bool, body: Bool, hands: Bool, face: Bool,
                 quality: VNGeneratePersonSegmentationRequest.QualityLevel,
                 batch: Bool, syphon: Bool, threshold: UInt8, contours: Bool,
-                contourStreaming: Bool) {
+                contourStreaming: Bool, handStreaming: Bool) {
         lock.withLock {
             _enableSeg = seg; _enableBody = body
             _enableHands = hands; _enableFace = face
@@ -42,6 +44,7 @@ final class PipelineConfig: @unchecked Sendable {
             _enableSyphon = syphon; _maskThreshold = threshold
             _enableContours = contours
             _enableContourStreaming = contourStreaming
+            _enableHandStreaming = handStreaming
         }
     }
 }
@@ -71,6 +74,25 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     private var contourHistory: [Double] = []
     nonisolated(unsafe) private var contourPointCounts: [Int] = []
     nonisolated(unsafe) private var contourLineCounts: [Int] = []
+    nonisolated(unsafe) private var lastContourLogTime: CFAbsoluteTime = 0
+
+    func dumpHandConfidences() {
+        guard let hands = latestResult?.handPoses, !hands.isEmpty else {
+            print("[hand] no hand pose in latest result")
+            fflush(stdout)
+            return
+        }
+        for (i, h) in hands.enumerated() {
+            let sorted = h.joints
+                .map { (k, v) in (k, v.1) }
+                .sorted { $0.1 > $1.1 }
+            print("[hand \(i)] chirality=\(h.chirality)")
+            for (k, c) in sorted {
+                print(String(format: "[hand \(i)] %@  conf=%.3f", k, c))
+            }
+        }
+        fflush(stdout)
+    }
     private let avgWindow = 10
 
     // UI-bound toggles
@@ -106,7 +128,8 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                       syphon: enableSyphon,
                       threshold: UInt8(min(255, max(0, maskThreshold * 255))),
                       contours: enableContours,
-                      contourStreaming: enableContourStreaming)
+                      contourStreaming: enableContourStreaming,
+                      handStreaming: enableHandStreaming)
     }
 
     private var captureSession: AVCaptureSession?
@@ -116,7 +139,6 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     // Vision requests
     private let segRequest: VNGeneratePersonSegmentationRequest
     private let bodyPoseRequest: VNDetectHumanBodyPoseRequest
-    private let handPoseRequest: VNDetectHumanHandPoseRequest
     private let faceLandmarksRequest: VNDetectFaceLandmarksRequest
     private let contourRequest: VNDetectContoursRequest
 
@@ -135,10 +157,12 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     nonisolated(unsafe) private var syphonServer: SyphonMetalServer?
     nonisolated(unsafe) private var maskedBuffer: CVPixelBuffer?
 
-    // Contour UDP streaming
+    // WebSocket streaming (port 9100; carries both contour and hand messages)
     @Published var enableContourStreaming = false
+    @Published var enableHandStreaming = false
     nonisolated(unsafe) private var contourSender: ContourWebSocketServer?
     nonisolated(unsafe) private var contourFrameNumber: UInt32 = 0
+    nonisolated(unsafe) private var handFrameNumber: UInt32 = 0
 
     override init() {
         segRequest = VNGeneratePersonSegmentationRequest()
@@ -146,9 +170,6 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         segRequest.outputPixelFormat = kCVPixelFormatType_OneComponent8
 
         bodyPoseRequest = VNDetectHumanBodyPoseRequest()
-
-        handPoseRequest = VNDetectHumanHandPoseRequest()
-        handPoseRequest.maximumHandCount = 2
 
         faceLandmarksRequest = VNDetectFaceLandmarksRequest()
         faceLandmarksRequest.constellation = .constellation76Points
@@ -321,6 +342,16 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         let quality = config.segQuality
         let batch = config.batchMode
         let doSyphon = config.enableSyphon
+        let streamContours = config.enableContourStreaming
+        let streamHands = config.enableHandStreaming
+
+        // WebSocket server lifecycle: alive whenever either stream is on.
+        if streamContours || streamHands {
+            if contourSender == nil { contourSender = ContourWebSocketServer() }
+        } else if contourSender != nil {
+            contourSender?.stop()
+            contourSender = nil
+        }
 
         if segRequest.qualityLevel != quality {
             segRequest.qualityLevel = quality
@@ -337,7 +368,12 @@ class VisionPipelineEngine: NSObject, ObservableObject {
             var requests: [VNRequest] = []
             if doSeg || doSyphon || doContours { requests.append(segRequest) }
             if doBody { requests.append(bodyPoseRequest) }
-            if doHands { requests.append(handPoseRequest) }
+            let batchHandRequest: VNDetectHumanHandPoseRequest? = doHands ? {
+                let r = VNDetectHumanHandPoseRequest()
+                r.maximumHandCount = 2
+                return r
+            }() : nil
+            if let r = batchHandRequest { requests.append(r) }
             if doFace { requests.append(faceLandmarksRequest) }
 
             if !requests.isEmpty {
@@ -349,7 +385,14 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                 maskPB = (segRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
             }
             if doBody { bodies = extractBodyPoses(imgW: imgW, imgH: imgH) }
-            if doHands { hands = extractHandPoses(imgW: imgW, imgH: imgH) }
+            if let r = batchHandRequest {
+                hands = extractHandPoses(from: r, imgW: imgW, imgH: imgH)
+                if streamHands {
+                    contourSender?.sendHand(hands, imgW: imgW, imgH: imgH,
+                                             frameNumber: handFrameNumber)
+                    handFrameNumber += 1
+                }
+            }
             if doFace { faces = extractFaceLandmarks(imgW: imgW, imgH: imgH) }
         } else {
             // Segmentation needed for viz, syphon, or contours
@@ -369,10 +412,22 @@ class VisionPipelineEngine: NSObject, ObservableObject {
 
             if doHands {
                 let s = CFAbsoluteTimeGetCurrent()
+                let freshHandRequest = VNDetectHumanHandPoseRequest()
+                freshHandRequest.maximumHandCount = 2
                 let handHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-                try? handHandler.perform([handPoseRequest])
+                do {
+                    try handHandler.perform([freshHandRequest])
+                } catch {
+                    print("[hand] perform error: \(error)")
+                    fflush(stdout)
+                }
                 tHand = (CFAbsoluteTimeGetCurrent() - s) * 1000
-                hands = extractHandPoses(imgW: imgW, imgH: imgH)
+                hands = extractHandPoses(from: freshHandRequest, imgW: imgW, imgH: imgH)
+                if streamHands {
+                    contourSender?.sendHand(hands, imgW: imgW, imgH: imgH,
+                                             frameNumber: handFrameNumber)
+                    handFrameNumber += 1
+                }
             }
 
             if doFace {
@@ -435,8 +490,12 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                     if contourLineCounts.count > 10 { contourLineCounts.removeFirst() }
                     let avgPts = contourPointCounts.reduce(0, +) / contourPointCounts.count
                     let avgLines = contourLineCounts.reduce(0, +) / contourLineCounts.count
-                    print("contours: \(avgLines) polylines, \(avgPts) pts avg (this frame: \(contourCount) lines, \(totalPoints) pts)")
-                    fflush(stdout)
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - lastContourLogTime >= 10 {
+                        print("contours: \(avgLines) polylines, \(avgPts) pts avg (this frame: \(contourCount) lines, \(totalPoints) pts)")
+                        fflush(stdout)
+                        lastContourLogTime = now
+                    }
 
                     // Remap from padded normalized coords to original mask normalized coords
                     var remap = CGAffineTransform(
@@ -446,19 +505,13 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                         ty: -CGFloat(border) / CGFloat(mH))
                     contourPath = obs.normalizedPath.copy(using: &remap)
 
-                    // Stream contours over UDP
+                    // Stream contours over WebSocket
                     if config.enableContourStreaming {
-                        if self.contourSender == nil {
-                            self.contourSender = ContourWebSocketServer()
-                        }
                         self.contourSender?.send(obs: obs,
                                                  padW: padW, padH: padH,
                                                  mW: mW, mH: mH, border: border,
                                                  frameNumber: self.contourFrameNumber)
                         self.contourFrameNumber += 1
-                    } else if self.contourSender != nil {
-                        self.contourSender?.stop()
-                        self.contourSender = nil
                     }
                 }
             }
@@ -527,8 +580,9 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         }
     }
 
-    nonisolated private func extractHandPoses(imgW: Int, imgH: Int) -> [HandPoseData] {
-        guard let observations = handPoseRequest.results as? [VNHumanHandPoseObservation] else { return [] }
+    nonisolated private func extractHandPoses(from request: VNDetectHumanHandPoseRequest,
+                                                imgW: Int, imgH: Int) -> [HandPoseData] {
+        guard let observations = request.results as? [VNHumanHandPoseObservation] else { return [] }
         return observations.compactMap { obs in
             guard let allPoints = try? obs.recognizedPoints(.all) else { return nil }
             var joints: [String: (CGPoint, Float)] = [:]

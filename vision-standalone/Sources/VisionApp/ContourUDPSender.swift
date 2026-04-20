@@ -23,20 +23,6 @@ import Vision
 /// POINT DATA (totalPoints × 8 bytes)
 ///   Packed Float32 pairs [x, y, x, y, ...]
 /// ```
-///
-/// Also carries hand bounding-box frames on the same connection, as TEXT
-/// (UTF-8 JSON). Contour consumers that only look at `ArrayBuffer` messages
-/// ignore these. Shape:
-/// ```json
-/// {
-///   "type": "hand",
-///   "frameNumber": 123,
-///   "hands": [
-///     {"chirality": "left", "validJointCount": 21, "bbox": [minX, minY, maxX, maxY]}
-///   ]
-/// }
-/// ```
-/// `bbox` is normalized [0,1] with top-left origin, same convention as contours.
 final class ContourWebSocketServer: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "contour-ws-server")
@@ -96,46 +82,16 @@ final class ContourWebSocketServer: @unchecked Sendable {
             let contour: VNContour
         }
 
-        // Frame-hugging contour rejection. The pipeline pads the seg mask with
-        // a zero border before running VNDetectContoursRequest, which means
-        // Vision traces the mask-area boundary as a contour whenever the
-        // silhouette is clipped by the camera edge. Detect it by bbox: in
-        // padded normalized coords, the mask fills mW/padW × mH/padH. Reject
-        // any top-level contour whose bbox covers ≥ 90% of both.
-        let widthThreshold = Float(mW) / Float(padW) * 0.9
-        let heightThreshold = Float(mH) / Float(padH) * 0.9
-
-        func isFrameHugging(_ c: VNContour) -> Bool {
-            let pts = c.normalizedPoints
-            if pts.count < 4 { return false }
-            var minX = pts[0].x, maxX = pts[0].x
-            var minY = pts[0].y, maxY = pts[0].y
-            for i in 1..<pts.count {
-                let p = pts[i]
-                if p.x < minX { minX = p.x } else if p.x > maxX { maxX = p.x }
-                if p.y < minY { minY = p.y } else if p.y > maxY { maxY = p.y }
-            }
-            return (maxX - minX) > widthThreshold && (maxY - minY) > heightThreshold
-        }
-
-        // Walk the contour hierarchy. If a contour is filtered out (too few
-        // points or frame-hugging), its children are promoted to the
-        // filtered contour's level so legitimate shapes nested inside the
-        // rejected rectangle (typical when Vision wraps everything under the
-        // padded frame boundary) still reach the wire.
         var flat: [FlatContour] = []
-        func walk(_ c: VNContour, parentIdx: Int16) {
-            let reject = c.pointCount < 5 || isFrameHugging(c)
-            let idx: Int16
-            if reject {
-                idx = parentIdx
-            } else {
-                idx = Int16(flat.count)
-                flat.append(FlatContour(parentIndex: parentIdx, contour: c))
+        for top in obs.topLevelContours {
+            guard top.pointCount >= 5 else { continue }
+            let topIdx = Int16(flat.count)
+            flat.append(FlatContour(parentIndex: -1, contour: top))
+            for child in top.childContours {
+                guard child.pointCount >= 5 else { continue }
+                flat.append(FlatContour(parentIndex: topIdx, contour: child))
             }
-            for child in c.childContours { walk(child, parentIdx: idx) }
         }
-        for top in obs.topLevelContours { walk(top, parentIdx: -1) }
 
         guard !flat.isEmpty else { return }
 
@@ -229,50 +185,6 @@ final class ContourWebSocketServer: @unchecked Sendable {
         let metadata = NWProtocolWebSocket.Metadata(opcode: .binary)
         let context = NWConnection.ContentContext(identifier: "contour",
                                                    metadata: [metadata])
-        lock.withLock {
-            for conn in connections {
-                conn.send(content: data, contentContext: context, completion: .contentProcessed { _ in })
-            }
-        }
-    }
-
-    /// Send a hand-bounding-box frame as a text WebSocket message (UTF-8 JSON).
-    /// Joints with `conf <= 0` (rejected) or `conf > 1.0` (garbage uint8 from the
-    /// Vision hand-pose bug) are excluded from the bounding box.
-    func sendHand(_ hands: [HandPoseData], imgW: Int, imgH: Int, frameNumber: UInt32) {
-        let handEntries: [String] = hands.compactMap { h in
-            var minX: CGFloat = .infinity, minY: CGFloat = .infinity
-            var maxX: CGFloat = -.infinity, maxY: CGFloat = -.infinity
-            var count = 0
-            for (_, (pt, conf)) in h.joints where conf > 0 && conf <= 1.0 {
-                if pt.x < minX { minX = pt.x }
-                if pt.y < minY { minY = pt.y }
-                if pt.x > maxX { maxX = pt.x }
-                if pt.y > maxY { maxY = pt.y }
-                count += 1
-            }
-            guard count > 0 else { return nil }
-            let chir: String = { switch h.chirality {
-                case .left: return "left"
-                case .right: return "right"
-                case .unknown: return "unknown"
-            } }()
-            let nx0 = Float(minX) / Float(imgW)
-            let ny0 = Float(minY) / Float(imgH)
-            let nx1 = Float(maxX) / Float(imgW)
-            let ny1 = Float(maxY) / Float(imgH)
-            return "{\"chirality\":\"\(chir)\",\"validJointCount\":\(count)," +
-                "\"bbox\":[\(nx0),\(ny0),\(nx1),\(ny1)]}"
-        }
-
-        guard !handEntries.isEmpty else { return }
-
-        let json = "{\"type\":\"hand\",\"frameNumber\":\(frameNumber),\"hands\":[" +
-            handEntries.joined(separator: ",") + "]}"
-        guard let data = json.data(using: .utf8) else { return }
-
-        let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
-        let context = NWConnection.ContentContext(identifier: "hand", metadata: [metadata])
         lock.withLock {
             for conn in connections {
                 conn.send(content: data, contentContext: context, completion: .contentProcessed { _ in })

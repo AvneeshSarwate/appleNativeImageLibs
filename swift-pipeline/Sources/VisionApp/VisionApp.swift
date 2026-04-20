@@ -50,6 +50,10 @@ struct VisionCameraView: View {
                         Toggle("Contours", isOn: $engine.enableContours)
                         Toggle("Body", isOn: $engine.enableBody)
                         Toggle("Hands", isOn: $engine.enableHands)
+                        if engine.enableHands {
+                            Button("Dump hand confs") { engine.dumpHandConfidences() }
+                                .buttonStyle(.bordered)
+                        }
                         Toggle("Face", isOn: $engine.enableFace)
 
                         Spacer().frame(height: 2)
@@ -58,7 +62,8 @@ struct VisionCameraView: View {
 
                         Spacer().frame(height: 2)
 
-                        Toggle("Stream contours (UDP)", isOn: $engine.enableContourStreaming)
+                        Toggle("Stream contours (WS)", isOn: $engine.enableContourStreaming)
+                        Toggle("Stream hands (WS)", isOn: $engine.enableHandStreaming)
 
                         Toggle("Syphon out", isOn: $engine.enableSyphon)
                         if engine.enableSyphon {
@@ -124,6 +129,7 @@ struct VisionCameraView: View {
         .onChange(of: engine.enableFace) { _ in engine.syncConfig() }
         .onChange(of: engine.batchMode) { _ in engine.syncConfig() }
         .onChange(of: engine.enableContourStreaming) { _ in engine.syncConfig() }
+        .onChange(of: engine.enableHandStreaming) { _ in engine.syncConfig() }
         .onChange(of: engine.enableSyphon) { _ in engine.syncConfig() }
         .onChange(of: engine.maskThreshold) { _ in engine.syncConfig() }
         .onChange(of: engine.selectedCameraId) { newId in engine.switchCamera(to: newId) }

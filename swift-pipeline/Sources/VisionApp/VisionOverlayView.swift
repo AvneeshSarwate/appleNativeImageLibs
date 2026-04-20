@@ -126,11 +126,13 @@ struct VisionOverlayView: View {
             for handPose in r.handPoses {
                 let handColor: Color = handPose.chirality == .left ? .cyan : .mint
 
-                // Draw bones
+                // Draw bones. Upper-bound filter intentionally omitted: a Vision bug
+                // sometimes returns uninitialized confidences (values like 191-255)
+                // for joints whose positions are still valid; only filter true zeros.
                 for (j1, j2) in HandSkeleton.connections {
                     guard let (p1, c1) = handPose.joints[j1.rawValue.rawValue],
                           let (p2, c2) = handPose.joints[j2.rawValue.rawValue],
-                          c1 > 0.3, c1 <= 1.0, c2 > 0.3, c2 <= 1.0 else { continue }
+                          c1 > 0.3, c2 > 0.3 else { continue }
                     let from = CGPoint(x: mapX(p1.x, scaleX, size.width), y: p1.y * scaleY)
                     let to = CGPoint(x: mapX(p2.x, scaleX, size.width), y: p2.y * scaleY)
                     var path = Path()
@@ -141,7 +143,7 @@ struct VisionOverlayView: View {
 
                 // Draw joints
                 for (_, (pt, conf)) in handPose.joints {
-                    if conf < 0.3 || conf > 1.0 { continue }
+                    if conf < 0.3 { continue }
                     let x = mapX(pt.x, scaleX, size.width)
                     let y = pt.y * scaleY
                     let circle = Path(ellipseIn: CGRect(x: x - 2.5, y: y - 2.5, width: 5, height: 5))
