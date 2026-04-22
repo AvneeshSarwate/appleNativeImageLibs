@@ -63,6 +63,24 @@ swift-pipeline/.build/release/CoreMLPipeline <video-path> [num-frames]
 swift-pipeline/.build/release/CoreMLPipeline --bench  # standalone model benchmarks
 ```
 
+### 4. Run VisionApp for live camera testing
+
+VisionApp is the native Apple Vision camera app in `swift-pipeline`. For local
+development, launch it through SwiftPM so you run the current source build:
+
+```bash
+cd swift-pipeline
+swift run VisionApp
+```
+
+Do not use `swift-pipeline/dist/VisionApp` for local development unless you have
+rebuilt the distribution bundle; it is a packaged copy and can be stale.
+
+On the affected Sonoma 14.8.4 hand-tracking setup, `Hands` defaults to on as a
+workaround. Launch with hands out of frame, let the app process a few no-hand
+frames, then bring hands into frame. Toggling `Hands` on while hands are already
+visible can trigger the Vision hand-pose bug.
+
 ## Performance (M1 Max, 1080p input)
 
 | Pipeline | Per-frame | FPS |

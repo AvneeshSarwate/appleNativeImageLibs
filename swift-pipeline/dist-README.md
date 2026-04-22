@@ -53,8 +53,26 @@ This auto-syncs sources from `swift-pipeline/`, patches macOS 14 APIs, builds, a
 
 ```bash
 cd swift-pipeline
-swift build -c release
+swift run VisionApp
+```
+
+Use `swift run VisionApp` when testing current source changes. The
+`swift-pipeline/dist/VisionApp` binary is a packaged copy and can be stale.
+
+For an optimized local build:
+
+```bash
+cd swift-pipeline
+swift build -c release --product VisionApp
 .build/release/VisionApp
 ```
 
 Edit source files in `swift-pipeline/Sources/VisionApp/` — `bundle.sh` copies them automatically.
+
+## Hand Pose Note
+
+On the affected Sonoma 14.8.4 / M1 Max setup, `Hands` defaults to on as a
+workaround for a content-dependent Vision hand-pose bug. For best reliability,
+launch VisionApp with hands out of frame, let it process a few no-hand frames,
+then bring hands into frame. Toggling `Hands` on while hands are already visible
+can trigger `com.apple.Vision Code=9` or garbage confidence values.

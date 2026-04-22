@@ -5,6 +5,15 @@ struct VisionCameraView: View {
     @StateObject private var engine = VisionPipelineEngine()
 
     let qualityLabels = ["Fast", "Balanced", "Accurate"]
+    private var syphonSourceBinding: Binding<Bool> {
+        Binding(
+            get: { engine.sourceMode == .cameraViaSyphon },
+            set: { enabled in
+                engine.sourceMode = enabled ? .cameraViaSyphon : .cameraDirect
+                engine.syncConfig()
+            }
+        )
+    }
 
     var body: some View {
         ZStack {
@@ -24,6 +33,26 @@ struct VisionCameraView: View {
                 HStack(alignment: .top) {
                     // Left: controls
                     VStack(alignment: .leading, spacing: 6) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Input source")
+                                .foregroundColor(.gray)
+                            Picker("Input source", selection: $engine.sourceMode) {
+                                Text("Camera").tag(FrameSourceMode.cameraDirect)
+                                Text("Syphon").tag(FrameSourceMode.cameraViaSyphon)
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 220)
+                            Toggle("Camera via Syphon", isOn: syphonSourceBinding)
+                                .toggleStyle(.checkbox)
+                                .foregroundColor(engine.sourceMode == .cameraViaSyphon ? .orange : .white)
+                        }
+                        .padding(6)
+                        .background(Color.black.opacity(0.55))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(engine.sourceMode == .cameraViaSyphon ? Color.orange : Color.gray.opacity(0.6), lineWidth: 1)
+                        )
+
                         // Camera picker
                         Picker("Camera", selection: $engine.selectedCameraId) {
                             ForEach(engine.availableCameras) { cam in
@@ -114,6 +143,10 @@ struct VisionCameraView: View {
                             Text("syphon: \"VisionApp\"")
                                 .foregroundColor(.orange)
                         }
+                        if engine.sourceMode == .cameraViaSyphon {
+                            Text("source: syphon loopback")
+                                .foregroundColor(.orange)
+                        }
                     }
                     .font(.system(.caption, design: .monospaced))
                     .padding(8)
@@ -132,6 +165,7 @@ struct VisionCameraView: View {
         .onChange(of: engine.enableHandStreaming) { _ in engine.syncConfig() }
         .onChange(of: engine.enableSyphon) { _ in engine.syncConfig() }
         .onChange(of: engine.maskThreshold) { _ in engine.syncConfig() }
+        .onChange(of: engine.sourceMode) { _ in engine.syncConfig() }
         .onChange(of: engine.selectedCameraId) { newId in engine.switchCamera(to: newId) }
         .task {
             do {

@@ -4,13 +4,26 @@ Real-time camera app using Apple's native Vision framework for person segmentati
 
 ## Build & Run
 
+For local development, run the SwiftPM product directly:
+
 ```bash
 cd swift-pipeline
-swift build -c release
+swift run VisionApp
+```
+
+For an optimized local build:
+
+```bash
+cd swift-pipeline
+swift build -c release --product VisionApp
 .build/release/VisionApp
 ```
 
 No model files needed — Vision uses system-provided models.
+
+Do not use `swift-pipeline/dist/VisionApp` for local development unless you
+have explicitly rebuilt the distribution bundle. That binary is a packaged copy
+and can be stale relative to `Sources/VisionApp/`.
 
 ## What It Does
 
@@ -25,6 +38,7 @@ Runs 4 Vision requests per camera frame and renders results as overlays:
 
 ## UI Controls
 
+- **Input source**: `Camera` or internal `Camera via Syphon` loopback
 - **Left panel**: Toggle each layer on/off, segmentation quality (Fast/Balanced/Accurate), batch mode
 - **Right panel**: Rolling-average FPS, total frame time, per-request timing breakdown
 - **Batch mode**: Runs all requests in a single `perform()` call (faster, but no per-request timing)
@@ -50,7 +64,32 @@ Each request type uses a specific handler for correctness:
 | **Hand pose** | **`VNImageRequestHandler`** | `VNSequenceRequestHandler` produces invalid confidence values (>1.0, up to 255) on macOS 14 / M1 Max — a system-level quirk not documented by Apple |
 | Face landmarks | `VNSequenceRequestHandler` | Temporal smoothing works correctly |
 
-The overlay filters joints to confidence range [0.3, 1.0] as a safety net.
+The hand overlay intentionally uses only a lower confidence bound (`conf > 0.3`).
+On the affected Sonoma 14.8.4 setup, Vision sometimes returns valid hand joint
+positions with garbage confidence values above 1.0. Adding an upper bound hides
+otherwise usable joints. WebSocket hand bounding-box streaming still filters
+`conf > 0 && conf <= 1.0` to avoid garbage-confidence joints in bbox math.
+
+### Hand Pose Startup Workaround
+
+`Hands` defaults to on. This is intentional.
+
+On the affected Sonoma 14.8.4 / M1 Max setup, toggling hand pose on while hands
+are already visible can reliably trigger either `com.apple.Vision Code=9`
+(`-[__NSArrayM insertObject:atIndex:]: object cannot be nil`) or bad confidence
+values. Starting VisionApp with hand inference already enabled, letting it see a
+few no-hand frames, and then bringing hands into frame has been reliable across
+repeated manual runs.
+
+For the most stable hand tracking:
+
+```bash
+cd swift-pipeline
+swift run VisionApp
+```
+
+Launch with hands out of frame, then bring them in. Avoid turning `Hands` off and
+back on while hands are visible unless you are trying to reproduce the bug.
 
 ### Thread Model
 

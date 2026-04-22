@@ -677,7 +677,6 @@ No model directory argument needed (unlike CameraApp which needs
 
 ```bash
 cd /Users/avneeshsarwate/agentCombine/appleNativeImageLibs/swift-pipeline
-swift build -c release
 swift run VisionApp
 ```
 

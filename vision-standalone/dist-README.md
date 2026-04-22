@@ -53,8 +53,26 @@ Creates `dist/` with the binary + Syphon framework. Zip and send.
 
 ```bash
 cd swift-pipeline
-swift build -c release
+swift run VisionApp
+```
+
+Use `swift run VisionApp` when testing current source changes. The packaged
+`dist/VisionApp` binary can be stale relative to `swift-pipeline/Sources/VisionApp/`.
+
+For an optimized local build:
+
+```bash
+cd swift-pipeline
+swift build -c release --product VisionApp
 .build/release/VisionApp
 ```
 
 Both projects share the same VisionApp source code. When editing, modify the files in `swift-pipeline/Sources/VisionApp/` and copy them to `vision-standalone/Sources/VisionApp/` before bundling. The only difference is `.external` vs `.externalUnknown` for the camera device type (macOS 14+ renamed it).
+
+## Hand Pose Note
+
+On the affected Sonoma 14.8.4 / M1 Max setup, `Hands` defaults to on as a
+workaround for a content-dependent Vision hand-pose bug. For best reliability,
+launch VisionApp with hands out of frame, let it process a few no-hand frames,
+then bring hands into frame. Toggling `Hands` on while hands are already visible
+can trigger `com.apple.Vision Code=9` or garbage confidence values.

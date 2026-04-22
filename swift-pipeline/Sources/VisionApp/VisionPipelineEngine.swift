@@ -4,14 +4,30 @@ import Vision
 import CoreVideo
 import SwiftUI
 import Metal
+import IOSurface
 import Syphon
+
+enum FrameSourceMode: String, CaseIterable, Identifiable {
+    case cameraDirect
+    case cameraViaSyphon
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .cameraDirect: return "Camera"
+        case .cameraViaSyphon: return "Camera via Syphon"
+        }
+    }
+}
 
 /// Thread-safe config snapshot read from videoQueue
 final class PipelineConfig: @unchecked Sendable {
     private let lock = NSLock()
+    private var _sourceMode: FrameSourceMode = .cameraDirect
     private var _enableSeg = true
     private var _enableBody = false
-    private var _enableHands = false
+    private var _enableHands = true
     private var _enableFace = false
     private var _segQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced
     private var _batchMode = false
@@ -21,6 +37,7 @@ final class PipelineConfig: @unchecked Sendable {
     private var _enableContourStreaming = false
     private var _enableHandStreaming = false
 
+    var sourceMode: FrameSourceMode { lock.withLock { _sourceMode } }
     var enableSeg: Bool { lock.withLock { _enableSeg } }
     var enableBody: Bool { lock.withLock { _enableBody } }
     var enableHands: Bool { lock.withLock { _enableHands } }
@@ -33,11 +50,13 @@ final class PipelineConfig: @unchecked Sendable {
     var enableContourStreaming: Bool { lock.withLock { _enableContourStreaming } }
     var enableHandStreaming: Bool { lock.withLock { _enableHandStreaming } }
 
-    func update(seg: Bool, body: Bool, hands: Bool, face: Bool,
+    func update(sourceMode: FrameSourceMode,
+                seg: Bool, body: Bool, hands: Bool, face: Bool,
                 quality: VNGeneratePersonSegmentationRequest.QualityLevel,
                 batch: Bool, syphon: Bool, threshold: UInt8, contours: Bool,
                 contourStreaming: Bool, handStreaming: Bool) {
         lock.withLock {
+            _sourceMode = sourceMode
             _enableSeg = seg; _enableBody = body
             _enableHands = hands; _enableFace = face
             _segQuality = quality; _batchMode = batch
@@ -96,9 +115,10 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     private let avgWindow = 10
 
     // UI-bound toggles
+    @Published var sourceMode: FrameSourceMode = .cameraDirect
     @Published var enableSeg = true
     @Published var enableBody = false
-    @Published var enableHands = false
+    @Published var enableHands = true
     @Published var enableFace = false
     @Published var enableContours = false
     @Published var segQualityIndex = 1  // 0=fast, 1=balanced, 2=accurate
@@ -122,7 +142,8 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         case 2: q = .accurate
         default: q = .balanced
         }
-        config.update(seg: enableSeg, body: enableBody,
+        config.update(sourceMode: sourceMode,
+                      seg: enableSeg, body: enableBody,
                       hands: enableHands, face: enableFace,
                       quality: q, batch: batchMode,
                       syphon: enableSyphon,
@@ -156,6 +177,9 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     nonisolated(unsafe) private var textureCache: CVMetalTextureCache?
     nonisolated(unsafe) private var syphonServer: SyphonMetalServer?
     nonisolated(unsafe) private var maskedBuffer: CVPixelBuffer?
+    nonisolated(unsafe) private var loopbackServer: SyphonMetalServer?
+    nonisolated(unsafe) private var loopbackClient: SyphonMetalClient?
+    nonisolated(unsafe) private var loopbackFrameCount: Int = 0
 
     // WebSocket streaming (port 9100; carries both contour and hand messages)
     @Published var enableContourStreaming = false
@@ -243,6 +267,7 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     func stop() {
         captureSession?.stopRunning()
         syphonServer?.stop()
+        stopLoopback()
         isRunning = false
     }
 
@@ -252,6 +277,130 @@ class VisionPipelineEngine: NSObject, ObservableObject {
         if syphonServer == nil {
             syphonServer = SyphonMetalServer(name: "VisionApp", device: metalDevice, options: nil)
         }
+    }
+
+    nonisolated private func ensureLoopback() {
+        guard loopbackServer == nil || loopbackClient == nil else { return }
+
+        let server = SyphonMetalServer(name: "VisionApp Camera Loopback", device: metalDevice, options: nil)
+        let client = SyphonMetalClient(serverDescription: server.serverDescription,
+                                       device: metalDevice,
+                                       options: nil,
+                                       newFrameHandler: nil)
+        loopbackServer = server
+        loopbackClient = client
+        loopbackFrameCount = 0
+        print("[source] internal Syphon loopback started: \"VisionApp Camera Loopback\"")
+        fflush(stdout)
+    }
+
+    nonisolated private func stopLoopback() {
+        if loopbackServer != nil || loopbackClient != nil {
+            loopbackClient?.stop()
+            loopbackServer?.stop()
+            loopbackClient = nil
+            loopbackServer = nil
+            loopbackFrameCount = 0
+            print("[source] internal Syphon loopback stopped")
+            fflush(stdout)
+        }
+    }
+
+    nonisolated private func publishCameraFrameToLoopback(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        guard let cache = textureCache else { return false }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        var cvTex: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, pixelBuffer, nil,
+            .bgra8Unorm, width, height, 0, &cvTex)
+        guard status == kCVReturnSuccess,
+              let cvTex = cvTex,
+              let texture = CVMetalTextureGetTexture(cvTex),
+              let cmdBuf = commandQueue.makeCommandBuffer()
+        else {
+            print("[source] failed to create Metal texture from camera frame for Syphon loopback (status \(status))")
+            fflush(stdout)
+            return false
+        }
+
+        loopbackServer?.publishFrameTexture(texture, on: cmdBuf,
+                                            imageRegion: NSRect(x: 0, y: 0, width: width, height: height),
+                                            flipped: false)
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+        return true
+    }
+
+    nonisolated private func pixelBufferFromSyphonTexture(_ texture: MTLTexture) -> CVPixelBuffer? {
+        if let surface = texture.iosurface {
+            var unmanagedPixelBuffer: Unmanaged<CVPixelBuffer>?
+            let attrs: [String: Any] = [
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+            ]
+            let status = CVPixelBufferCreateWithIOSurface(
+                kCFAllocatorDefault,
+                surface,
+                attrs as CFDictionary,
+                &unmanagedPixelBuffer
+            )
+            if status == kCVReturnSuccess, let unmanagedPixelBuffer {
+                return unmanagedPixelBuffer.takeRetainedValue()
+            }
+        }
+
+        var pixelBuffer: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+        ]
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            texture.width,
+            texture.height,
+            kCVPixelFormatType_32BGRA,
+            attrs as CFDictionary,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        texture.getBytes(base,
+                         bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                         from: MTLRegionMake2D(0, 0, texture.width, texture.height),
+                         mipmapLevel: 0)
+        return pixelBuffer
+    }
+
+    nonisolated private func processFrameViaLoopback(_ pixelBuffer: CVPixelBuffer) {
+        ensureLoopback()
+        guard publishCameraFrameToLoopback(pixelBuffer),
+              let texture = loopbackClient?.newFrameImage(),
+              let loopbackPixelBuffer = pixelBufferFromSyphonTexture(texture)
+        else {
+            print("[source] internal Syphon loopback did not produce a frame")
+            fflush(stdout)
+            return
+        }
+
+        loopbackFrameCount += 1
+        if loopbackFrameCount == 1 || loopbackFrameCount % 120 == 0 {
+            let inW = CVPixelBufferGetWidth(pixelBuffer)
+            let inH = CVPixelBufferGetHeight(pixelBuffer)
+            let inRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+            let outW = CVPixelBufferGetWidth(loopbackPixelBuffer)
+            let outH = CVPixelBufferGetHeight(loopbackPixelBuffer)
+            let outRow = CVPixelBufferGetBytesPerRow(loopbackPixelBuffer)
+            let inSurface = CVPixelBufferGetIOSurface(pixelBuffer) != nil
+            let outSurface = CVPixelBufferGetIOSurface(loopbackPixelBuffer) != nil
+            print("[source] loopback frame \(loopbackFrameCount): camera \(inW)x\(inH) row=\(inRow) iosurface=\(inSurface) -> syphon \(outW)x\(outH) row=\(outRow) iosurface=\(outSurface)")
+            fflush(stdout)
+        }
+
+        processFrame(loopbackPixelBuffer)
     }
 
     nonisolated private func publishMaskedFrame(camera: CVPixelBuffer, mask: CVPixelBuffer) {
@@ -636,6 +785,12 @@ extension VisionPipelineEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                                     didOutput sampleBuffer: CMSampleBuffer,
                                     from connection: AVCaptureConnection) {
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        processFrame(pb)
+        switch config.sourceMode {
+        case .cameraDirect:
+            stopLoopback()
+            processFrame(pb)
+        case .cameraViaSyphon:
+            processFrameViaLoopback(pb)
+        }
     }
 }
