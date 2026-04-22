@@ -164,8 +164,10 @@ class VisionPipelineEngine: NSObject, ObservableObject {
     private let contourRequest: VNDetectContoursRequest
 
     // Sequence handlers
+    private let batchSeqHandler = VNSequenceRequestHandler()
     private let segSeqHandler = VNSequenceRequestHandler()
     private let bodySeqHandler = VNSequenceRequestHandler()
+    private let handSeqHandler = VNSequenceRequestHandler()
     private let faceSeqHandler = VNSequenceRequestHandler()
 
     // Timing
@@ -526,8 +528,7 @@ class VisionPipelineEngine: NSObject, ObservableObject {
             if doFace { requests.append(faceLandmarksRequest) }
 
             if !requests.isEmpty {
-                let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-                try? handler.perform(requests)
+                try? batchSeqHandler.perform(requests, on: pixelBuffer)
             }
 
             if doSeg || doSyphon || doContours {
@@ -563,9 +564,8 @@ class VisionPipelineEngine: NSObject, ObservableObject {
                 let s = CFAbsoluteTimeGetCurrent()
                 let freshHandRequest = VNDetectHumanHandPoseRequest()
                 freshHandRequest.maximumHandCount = 2
-                let handHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
                 do {
-                    try handHandler.perform([freshHandRequest])
+                    try handSeqHandler.perform([freshHandRequest], on: pixelBuffer)
                 } catch {
                     print("[hand] perform error: \(error)")
                     fflush(stdout)
